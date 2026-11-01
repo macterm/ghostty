@@ -737,6 +737,21 @@ fn actionCommands(action: Action.Key) []const Command {
         .crash,
         => comptime &.{},
 
+        // No commands because they are the steps of a keyboard copy mode,
+        // which a palette has no place in.
+        .start_selection,
+        .move_selection,
+        .extend_selection,
+        .select_word,
+        .collapse_selection,
+        .flip_selection,
+        .select_line,
+        .select_line_bounds,
+        .selection_rectangle,
+        .clear_selection,
+        .selection_cursor,
+        => comptime &.{},
+
         // No commands because I'm not sure they make sense in a command
         // palette context.
         .toggle_command_palette,
