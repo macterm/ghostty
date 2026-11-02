@@ -1,0 +1,234 @@
+From 9e3499039a775ed009f047fcb9d305a04e3a5932 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Wed, 21 Oct 2026 19:35:56 -0400
+Subject: [PATCH] renderer: ease the viewport move of a copy mode page motion
+ under smooth-scroll
+
+A half-page motion of copy mode moved the selection head, and
+scrollToSelectionHead jumped the viewport with screen.scroll, which
+records no distance. Helix scrolls its own region for the same key
+(DECSTBM and SU), which the region scroll animation eases, so the two
+looked different under smooth-scroll.
+
+Now the head scroll records its move through rowScrollOffset, as a
+wheel move does under smooth-scroll-rows, and flags the offset as a
+move to ease (Screen.viewport_offset_eases). The renderer decays a
+flagged offset in the plain smooth-scroll mode too. A wheel event, a
+row-level scroll and a landed ease clear the flag, so a gesture
+remainder is never decayed.
+---
+ .github/workflows/build-ghosttykit.yml |  2 +-
+ src/Surface.zig                        | 36 ++++++++++++++++++++++----
+ src/renderer/generic.zig               | 26 +++++++++++++------
+ src/terminal/Screen.zig                | 23 +++++++++++++++-
+ 4 files changed, 72 insertions(+), 15 deletions(-)
+
+diff --git a/.github/workflows/build-ghosttykit.yml b/.github/workflows/build-ghosttykit.yml
+index 600f3fd0b..1bf82a231 100644
+--- a/.github/workflows/build-ghosttykit.yml
++++ b/.github/workflows/build-ghosttykit.yml
+@@ -99,7 +99,7 @@ jobs:
+       # "parse:" covers the keybind parser, which every new binding action
+       # goes through.
+       - name: Test downstream patches
+-        run: zig build test -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="parse:"
++        run: zig build test -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="viewport eases" -Dtest-filter="parse:"
+ 
+       - name: Build xcframework
+         run: zig build -Doptimize=ReleaseFast -Dsentry=false -Demit-xcframework=true -Dxcframework-target=universal -Demit-macos-app=false -Demit-themes=true
+diff --git a/src/Surface.zig b/src/Surface.zig
+index f2abee376..d0fd01e42 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -3831,6 +3831,8 @@ pub fn scrollCallback(
+                     self.mouse.pending_scroll_y
+                 else
+                     0;
++            // A wheel takes over from a keyboard move that is still easing.
++            screen.viewport_offset_eases = false;
+         }
+     }
+ 
+@@ -6075,7 +6077,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool
+             const screen: *terminal.Screen = self.io.terminal.screens.active;
+             const sel = if (screen.selection) |*sel| sel else return false;
+             sel.expandToLines(screen);
+-            scrollToSelectionHead(screen, sel);
++            self.scrollToSelectionHead(screen, sel);
+             screen.dirty.selection = true;
+             try self.queueRender();
+         },
+@@ -6088,7 +6090,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool
+             const screen: *terminal.Screen = self.io.terminal.screens.active;
+             const sel = if (screen.selection) |*sel| sel else return false;
+             sel.expandToLineBounds(screen);
+-            scrollToSelectionHead(screen, sel);
++            self.scrollToSelectionHead(screen, sel);
+             screen.dirty.selection = true;
+             try self.queueRender();
+         },
+@@ -6175,7 +6177,7 @@ fn moveSelection(
+         .top => .top,
+         .bottom => .bottom,
+     }, extend, self.config.selection_word_chars);
+-    scrollToSelectionHead(screen, sel);
++    self.scrollToSelectionHead(screen, sel);
+     screen.dirty.selection = true;
+     try self.queueRender();
+ }
+@@ -6196,14 +6198,25 @@ fn selectWord(
+         .end => .end,
+         .prev => .prev,
+     }, self.config.selection_word_chars);
+-    scrollToSelectionHead(screen, sel);
++    self.scrollToSelectionHead(screen, sel);
+     screen.dirty.selection = true;
+     try self.queueRender();
+ }
+ 
+ /// Scroll the viewport so the selection head (`end`) is in it, the way
+ /// `adjust_selection` follows its end. The renderer mutex must be held.
+-fn scrollToSelectionHead(screen: *terminal.Screen, sel: *terminal.Selection) void {
++///
++/// With `smooth-scroll` on, the move eases: the viewport jumps by rows,
++/// and the content is drawn from where it was (`rowScrollOffset`) for the
++/// renderer to ease home (`decayViewportScroll`), as a wheel move does
++/// under `smooth-scroll-rows`. A page motion of copy mode then scrolls as
++/// Helix scrolls its own region, which is a region scroll that the same
++/// curve animates.
++fn scrollToSelectionHead(
++    self: *Surface,
++    screen: *terminal.Screen,
++    sel: *terminal.Selection,
++) void {
+     const viewport_tl = screen.pages.getTopLeft(.viewport);
+     const viewport_br = screen.pages.getBottomRight(.viewport).?;
+     if (sel.end().isBetween(viewport_tl, viewport_br)) return;
+@@ -6214,7 +6227,20 @@ fn scrollToSelectionHead(screen: *terminal.Screen, sel: *terminal.Selection) voi
+         sel.end()
+     else
+         sel.end().up(screen.pages.rows - 1) orelse sel.end();
++
++    const drawn = screen.viewport_pixel_offset;
++    const before = screen.pages.scrollbar().offset;
+     screen.scroll(.{ .pin = target });
++    if (!self.config.smooth_scroll) return;
++    const after = screen.pages.scrollbar().offset;
++    screen.viewport_pixel_offset = rowScrollOffset(
++        drawn,
++        before,
++        after,
++        @floatFromInt(self.size.cell.height),
++        screen.pages.rows,
++    );
++    screen.viewport_offset_eases = screen.viewport_pixel_offset != 0;
+ }
+ 
+ /// Returns true if performing the given action result in closing
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 0ce5539ea..b4354d11e 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -1736,17 +1736,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             }
+         }
+ 
+-        /// Ease a `smooth-scroll-rows` viewport move toward its place: the
+-        /// offset the surface left (`Surface.rowScrollOffset`) decays on the
+-        /// region scroll animation's curve, so scrollback and a program's
+-        /// own scrolled region move alike. It lives in the terminal, not
+-        /// here, so the hit test, the cursor and selection all see what is
+-        /// drawn without a copy of it. Called under the terminal lock before
+-        /// the render state reads the offset.
++        /// Ease a `smooth-scroll-rows` viewport move, or a keyboard move
++        /// of the viewport (`Screen.viewport_offset_eases`), toward its
++        /// place: the offset the surface left (`Surface.rowScrollOffset`)
++        /// decays on the region scroll animation's curve, so scrollback and
++        /// a program's own scrolled region move alike. It lives in the
++        /// terminal, not here, so the hit test, the cursor and selection
++        /// all see what is drawn without a copy of it. Called under the
++        /// terminal lock before the render state reads the offset.
+         fn decayViewportScroll(self: *Self, screen: *terminal.Screen) void {
+             const offset = screen.viewport_pixel_offset;
+             if (offset == 0) {
+                 self.viewport_anim_tick = null;
++                screen.viewport_offset_eases = false;
+                 return;
+             }
+             const now: std.Io.Timestamp = .now(global.io(), .awake);
+@@ -1760,6 +1762,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             const next = offset * @exp(-(dt_ns / std.time.ns_per_s) / region_anim_tau_s);
+             if (@abs(next) < 0.5) {
+                 screen.viewport_pixel_offset = 0;
++                screen.viewport_offset_eases = false;
+                 self.viewport_anim_tick = null;
+             } else {
+                 screen.viewport_pixel_offset = next;
+@@ -2279,7 +2282,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 //
+                 // Smooth scrolling by rows: advance the viewport's move
+                 // before the shift is resolved, so this frame draws it.
+-                if (self.config.smooth_scroll and self.config.smooth_scroll_rows) {
++                //
++                // A keyboard move of the viewport (copy mode scrolling to
++                // its head) eases in the plain mode too: the surface flags
++                // its offset as a move, not a gesture remainder.
++                if (self.config.smooth_scroll and
++                    (self.config.smooth_scroll_rows or
++                        state.terminal.screens.active.viewport_offset_eases))
++                {
+                     self.decayViewportScroll(state.terminal.screens.active);
+                 } else {
+                     self.viewport_anim_tick = null;
+diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
+index 3ff73c354..4fef288ce 100644
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -71,6 +71,14 @@ selection: ?Selection = null,
+ /// (an offset pointing at a row that doesn't exist is drawn as zero).
+ viewport_pixel_offset: f64 = 0,
+ 
++/// True while `viewport_pixel_offset` is a row-level move for the renderer
++/// to ease home, not the remainder of a wheel gesture: a keyboard move of
++/// the viewport under `smooth-scroll`, as copy mode makes when it scrolls
++/// to the selection head. The surface sets it with the offset. `scroll`
++/// and the scroll callback clear it, and the renderer clears it when the
++/// ease lands. Under `smooth-scroll-rows` every offset eases, flag or not.
++viewport_offset_eases: bool = false,
++
+ /// Scrolls of a region of the alternate screen by whole rows that have
+ /// happened since the renderer last looked (see `RegionScrolls`). With
+ /// `smooth-scroll` on, the renderer animates them: the region's new
+@@ -1756,8 +1764,10 @@ pub inline fn scroll(self: *Screen, behavior: Scroll) void {
+     defer self.assertIntegrity();
+ 
+     // A row-level move invalidates any sub-row remainder; the scroll
+-    // callback re-publishes its own remainder after the move.
++    // callback re-publishes its own remainder after the move, and a
++    // keyboard move its own eased offset.
+     self.viewport_pixel_offset = 0;
++    self.viewport_offset_eases = false;
+ 
+     if (comptime build_options.kitty_graphics) {
+         // No matter what, scrolling marks our image state as dirty since
+@@ -4054,6 +4064,17 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
+     }
+ }
+ 
++test "Screen viewport eases flag clears on a scroll" {
++    const testing = std.testing;
++    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
++    defer s.deinit();
++    s.viewport_pixel_offset = 12;
++    s.viewport_offset_eases = true;
++    s.scroll(.{ .top = {} });
++    try testing.expectEqual(0, s.viewport_pixel_offset);
++    try testing.expect(!s.viewport_offset_eases);
++}
++
+ test "Screen forwards optional scrollback limits" {
+     const testing = std.testing;
+     const max_lines: usize = 123;
+-- 
+2.54.0 (Apple Git-157)
+
