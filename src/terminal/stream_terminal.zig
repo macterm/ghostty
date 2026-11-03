@@ -617,6 +617,14 @@ pub const Handler = struct {
         };
     }
 
+    /// The stream's hook for runs it knows are printable ASCII.
+    pub fn vtPrintAscii(self: *Handler, bytes: []const u8) void {
+        self.terminal.printSliceAscii(bytes) catch |err| {
+            self.semantic_failure = true;
+            log.warn("error handling VT action action=print_slice err={}", .{err});
+        };
+    }
+
     fn unknownSequence(self: *Handler, value: UnknownSequence) void {
         const func = self.unknown_sequence orelse return;
         func(self, value);
@@ -3032,10 +3040,10 @@ test "SGR with several attributes interns one style" {
     try testing.expect(want.flags.italic);
     try testing.expectEqual(.single, want.flags.underline);
     try testing.expectEqual(
-        Style.Color{ .rgb = .{ .r = 10, .g = 20, .b = 30 } },
+        Style.Color.rgb(.{ .r = 10, .g = 20, .b = 30 }),
         want.fg_color,
     );
-    try testing.expectEqual(Style.Color{ .palette = 200 }, want.bg_color);
+    try testing.expectEqual(Style.Color.palette(200), want.bg_color);
 
     // Both printed cells reference the new style.
     for (1..3) |x| {
@@ -3049,7 +3057,7 @@ test "SGR with several attributes interns one style" {
     const a = screen.pages.getCell(.{ .active = .{} }).?.cell;
     try testing.expect(a.style_id != id);
     try testing.expectEqual(
-        Style.Color{ .palette = 1 },
+        Style.Color.palette(1),
         page.styles.get(page.memory, a.style_id).fg_color,
     );
 

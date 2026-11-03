@@ -53,6 +53,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+arc-source-coder
 aredmondd
 arneshbanerjee
 arvin7liu
@@ -104,8 +105,10 @@ d-dudas
 daiimus
 damyanbogoev
 danneu
+danudey
 danulqua
 dariogriffo
+database64128
 dave92082
 davey-hughes
 davidhodge
@@ -158,6 +161,7 @@ fru1tworld
 gaborbernat
 gadgetman6
 gagbo
+ghdtjdwn
 ghokun
 gmile
 gordonbondon
@@ -415,6 +419,7 @@ yak3d
 yamshta
 ydah
 yeager
+yinxiangshi
 -zaviro
 zenangst
 zenyr

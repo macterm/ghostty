@@ -1,4 +1,4 @@
-From 803a790651c9e2e195ce0a6bc0f40910c28885fc Mon Sep 17 00:00:00 2001
+From 00de167faebe72e521142917b28aea3184b23e50 Mon Sep 17 00:00:00 2001
 From: Ethan Lee <ethantlee21@gmail.com>
 Date: Wed, 21 Oct 2026 11:37:36 -0400
 Subject: [PATCH] config: add command-wrapper to run resolved command under a
@@ -22,21 +22,21 @@ shell integration fully intact, instead of replacing command outright.
  5 files changed, 72 insertions(+), 1 deletion(-)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 9a12b9cad..334db8928 100644
+index 674d6d089..e582aad64 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
-@@ -518,6 +518,9 @@ typedef struct {
-   const char* initial_input;
+@@ -534,6 +534,9 @@ typedef struct {
+   const char* GHOSTTY_NULLABLE initial_input;
    bool wait_after_command;
    ghostty_surface_context_e context;
-+  const char* const* command_wrapper;
++  const char* GHOSTTY_NULLABLE const* GHOSTTY_NULLABLE command_wrapper;
 +  size_t command_wrapper_count;
 +  bool disable_shell_integration;
  } ghostty_surface_config_s;
  
  typedef struct {
 diff --git a/src/Surface.zig b/src/Surface.zig
-index 369bb2399..069d60f52 100644
+index 7f7b1df88..98ad00f30 100644
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
 @@ -687,6 +687,7 @@ pub fn init(
@@ -48,7 +48,7 @@ index 369bb2399..069d60f52 100644
              .env_override = config.env,
              .shell_integration = config.@"shell-integration",
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index 697f0a786..1df1fd89f 100644
+index 548169bc1..7de4f5da8 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -499,6 +499,19 @@ pub const Surface = struct {
@@ -98,7 +98,7 @@ index 697f0a786..1df1fd89f 100644
          if (opts.env_var_count > 0) {
              const alloc = config.arenaAlloc();
 diff --git a/src/config/Config.zig b/src/config/Config.zig
-index 19667ab70..be5a59eab 100644
+index 9eeff4340..94e80f67c 100644
 --- a/src/config/Config.zig
 +++ b/src/config/Config.zig
 @@ -1194,6 +1194,22 @@ command: ?Command = null,
@@ -125,7 +125,7 @@ index 19667ab70..be5a59eab 100644
  /// three options:
  ///
 diff --git a/src/termio/Exec.zig b/src/termio/Exec.zig
-index df57e0f4f..c99845581 100644
+index df57e0f4f..547902359 100644
 --- a/src/termio/Exec.zig
 +++ b/src/termio/Exec.zig
 @@ -567,6 +567,7 @@ pub const ThreadData = struct {

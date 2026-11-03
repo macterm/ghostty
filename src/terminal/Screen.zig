@@ -1181,12 +1181,15 @@ pub fn cursorDownScroll(self: *Screen) !void {
             self.cursor.page_cell = page_rac.cell;
         }
 
-        // Our new row is always dirty
-        self.cursorMarkDirty();
+        // Our new row is always dirty. It is also always in the zero
+        // state: from unused page capacity, a fresh page, or a recycled
+        // page that grow() zeroed. Marking it blank too, in the same
+        // write, lets printing into it skip checking its old cells.
+        self.cursor.page_row.markCleared();
 
         // Clear the new row so it gets our bg color. We only do this
         // if we have a bg color at all.
-        if (self.cursor.style.bg_color != .none) {
+        if (self.cursor.style.bg_color.tag != .none) {
             const page: *Page = self.cursor.page_pin.node.page();
             self.clearCells(
                 page,
@@ -1438,14 +1441,15 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     const page: *Page = pin.node.pageAssumeResident();
     const rows = page.rows.ptr(page.memory.ptr)[pin.y - limit ..][0 .. limit + 1];
 
-    // Clear the erased (top) row.
-    {
+    // Clear the erased (top) row and build its reset header, which the
+    // rotation below writes into the row's new slot.
+    const reset_row: Row = reset: {
         const row: *Row = &rows[0];
 
         // Whether our blank cell is a plain zero cell. This is true
         // unless the cursor has a background color set (see blankCell).
         const blank_is_zero = self.cursor.style_id == style.default_id or
-            self.cursor.style.bg_color == .none;
+            self.cursor.style.bg_color.tag == .none;
 
         if (!row.managedMemory() and blank_is_zero) {
             // Hot path: the row has no managed memory (styles,
@@ -1462,15 +1466,22 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
 
         // The row becomes the new blank cursor row after the rotation
         // below and must not retain metadata (wrap state, semantic
-        // prompt) from the discarded content.
-        row.reset();
-    }
+        // prompt) from the discarded content. This is Row.reset.
+        assert(!row.managedMemory());
+        break :reset .{ .cells = row.cells, .dirty = true };
+    };
 
     // Rotate the region rows so the now-blank top row moves to the
     // bottom (the cursor row) and everything else shifts up by one.
     // Rotating the region changes which logical row its coordinates identify.
+    //
+    // The reset header goes straight to its new slot rather than through
+    // row.reset() and rotateOnce: x86-64 codegen narrows that reset to a
+    // 4-byte store, and the rotation's 8-byte load of the same header
+    // right after it can't be store-forwarded, which stalls every
+    // scrolled line (about 6% on vtebench's region scrolling).
     self.pages.invalidateNodeLayout(pin.node);
-    fastmem.rotateOnce(Row, rows);
+    _ = fastmem.rotateIn(Row, rows, reset_row);
 
     // Mark the whole page as dirty.
     //
@@ -1993,6 +2004,11 @@ pub fn clearRows(
 /// It also updates `Row.blank`. A full-row clear with a zero blank cell
 /// sets it, a colored blank cell clears it, and a partial clear with a
 /// zero blank cell leaves it unchanged.
+///
+/// Clearing any part of a row marked blank with a zero blank cell does
+/// nothing, since the cells are already zero and there is no managed
+/// memory to release. Full-screen programs often erase lines (EL, ECH)
+/// that are already empty when they redraw.
 pub fn clearCells(
     self: *Screen,
     page: *Page,
@@ -2000,6 +2016,7 @@ pub fn clearCells(
     cells: []Cell,
 ) void {
     if (cells.len == 0) return;
+    if (row.blank and self.blankCell().isZero()) return;
 
     // This whole operation does unsafe things, so we just want to assert
     // the end state.
@@ -2575,7 +2592,7 @@ pub fn setAttribute(
     attr: sgr.Attribute,
 ) PageList.IncreaseCapacityError!void {
     const old_style = self.cursor.style;
-    self.applyAttribute(attr);
+    self.cursor.style = self.cursor.style.withAttribute(attr);
     try self.commitStyle(old_style);
 }
 
@@ -2592,163 +2609,17 @@ pub fn setAttributes(
 ) PageList.IncreaseCapacityError!void {
     const old_style = self.cursor.style;
     var p = parser;
-    while (p.next()) |attr| self.applyAttribute(attr);
+    while (p.next()) |attr| self.cursor.style = self.cursor.style.withAttribute(attr);
     try self.commitStyle(old_style);
-}
-
-/// Apply a style attribute to the cursor style without updating the
-/// cursor style ID. `commitStyle` must follow before anything reads
-/// the cursor style ID.
-fn applyAttribute(self: *Screen, attr: sgr.Attribute) void {
-    switch (attr) {
-        .unset => {
-            self.cursor.style = .{};
-        },
-
-        .bold => {
-            self.cursor.style.flags.bold = true;
-        },
-
-        .reset_bold => {
-            // Bold and faint share the same SGR code for this
-            self.cursor.style.flags.bold = false;
-            self.cursor.style.flags.faint = false;
-        },
-
-        .italic => {
-            self.cursor.style.flags.italic = true;
-        },
-
-        .reset_italic => {
-            self.cursor.style.flags.italic = false;
-        },
-
-        .faint => {
-            self.cursor.style.flags.faint = true;
-        },
-
-        .underline => |v| {
-            self.cursor.style.flags.underline = v;
-        },
-
-        .underline_color => |rgb| {
-            self.cursor.style.underline_color = .{ .rgb = .{
-                .r = rgb.r,
-                .g = rgb.g,
-                .b = rgb.b,
-            } };
-        },
-
-        .@"256_underline_color" => |idx| {
-            self.cursor.style.underline_color = .{ .palette = idx };
-        },
-
-        .reset_underline_color => {
-            self.cursor.style.underline_color = .none;
-        },
-
-        .overline => {
-            self.cursor.style.flags.overline = true;
-        },
-
-        .reset_overline => {
-            self.cursor.style.flags.overline = false;
-        },
-
-        .blink => {
-            self.cursor.style.flags.blink = true;
-        },
-
-        .reset_blink => {
-            self.cursor.style.flags.blink = false;
-        },
-
-        .inverse => {
-            self.cursor.style.flags.inverse = true;
-        },
-
-        .reset_inverse => {
-            self.cursor.style.flags.inverse = false;
-        },
-
-        .invisible => {
-            self.cursor.style.flags.invisible = true;
-        },
-
-        .reset_invisible => {
-            self.cursor.style.flags.invisible = false;
-        },
-
-        .strikethrough => {
-            self.cursor.style.flags.strikethrough = true;
-        },
-
-        .reset_strikethrough => {
-            self.cursor.style.flags.strikethrough = false;
-        },
-
-        .direct_color_fg => |rgb| {
-            self.cursor.style.fg_color = .{
-                .rgb = .{
-                    .r = rgb.r,
-                    .g = rgb.g,
-                    .b = rgb.b,
-                },
-            };
-        },
-
-        .direct_color_bg => |rgb| {
-            self.cursor.style.bg_color = .{
-                .rgb = .{
-                    .r = rgb.r,
-                    .g = rgb.g,
-                    .b = rgb.b,
-                },
-            };
-        },
-
-        .@"8_fg" => |n| {
-            self.cursor.style.fg_color = .{ .palette = @backingInt(n) };
-        },
-
-        .@"8_bg" => |n| {
-            self.cursor.style.bg_color = .{ .palette = @backingInt(n) };
-        },
-
-        .reset_fg => self.cursor.style.fg_color = .none,
-
-        .reset_bg => self.cursor.style.bg_color = .none,
-
-        .@"8_bright_fg" => |n| {
-            self.cursor.style.fg_color = .{ .palette = @backingInt(n) };
-        },
-
-        .@"8_bright_bg" => |n| {
-            self.cursor.style.bg_color = .{ .palette = @backingInt(n) };
-        },
-
-        .@"256_fg" => |idx| {
-            self.cursor.style.fg_color = .{ .palette = idx };
-        },
-
-        .@"256_bg" => |idx| {
-            self.cursor.style.bg_color = .{ .palette = idx };
-        },
-
-        // Unknown attributes are ignored. They are common enough in real
-        // output (a bare `38`, font selection `10`) that logging each one
-        // costs more than the sequence itself.
-        .unknown => {},
-    }
 }
 
 const commitStyle_tw = tripwire.module(enum {
     manual_style_update,
 }, commitStyle);
 
-/// Update the cursor style ID to match the cursor style after one or
-/// more `applyAttribute` calls. `old_style` is the cursor style from
-/// before those calls.
+/// Update the cursor style ID to match the cursor style after it was
+/// changed by one or more attributes. `old_style` is the cursor style
+/// from before those changes.
 ///
 /// If the style can't be set due to any internal errors (memory-related),
 /// then this reverts the cursor style to `old_style` (or the default
@@ -3194,7 +3065,7 @@ pub fn cursorSetHyperlink(self: *Screen) PageList.IncreaseCapacityError!void {
             // must grow.
             _ = try self.increaseCapacity(
                 self.cursor.page_pin.node,
-                .hyperlink_bytes,
+                .hyperlink_cells,
             );
 
             // Retry
@@ -4840,7 +4711,7 @@ test "Screen setAttributes applies several attributes with one style" {
     try testing.expect(interned.eql(s.cursor.style));
     try testing.expect(interned.flags.bold);
     try testing.expect(interned.flags.italic);
-    try testing.expectEqual(style.Style.Color{ .palette = 100 }, interned.fg_color);
+    try testing.expectEqual(style.Style.Color.palette(100), interned.fg_color);
 
     // A sequence that ends at the committed style keeps the same ID:
     // CSI 0;1;3;38;5;100 m
@@ -5372,7 +5243,7 @@ test "Screen: cursorAbsolute to page with insufficient capacity" {
         var n: u24 = 1;
         while (start_page.styles.add(
             start_page.memory,
-            .{ .bg_color = .{ .rgb = @bitCast(n) } },
+            .{ .bg_color = .rgb(@bitCast(n)) },
         )) |_| n += 1 else |_| {}
     }
 
@@ -9594,7 +9465,7 @@ test "Screen: resize more cols with cursor at prompt" {
     defer s.deinit();
 
     // zig fmt: off
-    try s.testWriteString("ABCDE\n"); 
+    try s.testWriteString("ABCDE\n");
     s.cursorSetSemanticContent(.{ .prompt = .initial });
     try s.testWriteString("> ");
     s.cursorSetSemanticContent(.{ .input = .clear_eol });
@@ -9635,7 +9506,7 @@ test "Screen: resize more cols with cursor not at prompt" {
     defer s.deinit();
 
     // zig fmt: off
-    try s.testWriteString("ABCDE\n"); 
+    try s.testWriteString("ABCDE\n");
     s.cursorSetSemanticContent(.{ .prompt = .initial });
     try s.testWriteString("> ");
     s.cursorSetSemanticContent(.{ .input = .clear_eol });
@@ -12232,7 +12103,7 @@ test "Screen: cursorDown to page with insufficient capacity" {
         var n: u24 = 1;
         while (new_page.styles.add(
             new_page.memory,
-            .{ .bg_color = .{ .rgb = @bitCast(n) } },
+            .{ .bg_color = .rgb(@bitCast(n)) },
         )) |_| n += 1 else |_| {}
     }
 
@@ -12300,7 +12171,7 @@ test "Screen setAttribute increases capacity when style map is full" {
         while (n < max_items) : (n += 1) {
             _ = page.styles.add(
                 page.memory,
-                .{ .bg_color = .{ .rgb = @bitCast(@as(u24, @intCast(n))) } },
+                .{ .bg_color = .rgb(@bitCast(@as(u24, @intCast(n)))) },
             ) catch break;
         }
     }
@@ -12366,7 +12237,7 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
         while (n < max_items) : (n += 1) {
             _ = page.styles.add(
                 page.memory,
-                .{ .bg_color = .{ .rgb = @bitCast(@as(u24, @intCast(n))) } },
+                .{ .bg_color = .rgb(@bitCast(@as(u24, @intCast(n)))) },
             ) catch break;
         }
     }
