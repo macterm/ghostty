@@ -507,6 +507,101 @@ pub const Action = union(enum) {
     ///
     adjust_selection: AdjustSelection,
 
+    /// Start a selection of one cell at the terminal cursor, if there is no
+    /// selection. Does nothing when there is one. This is the first step of
+    /// a keyboard copy mode: the selection is the cursor of that mode, its
+    /// end is the head that the motions move and its start is the anchor.
+    start_selection,
+
+    /// Move the selection head by a motion and put the anchor on it, so the
+    /// selection is one cell again, as a cursor move in Helix normal mode.
+    /// Starts a selection at the terminal cursor when there is none.
+    ///
+    /// Valid motions are:
+    ///
+    ///   - `left`, `right`: one cell, within the row.
+    ///   - `up`, `down`: one row, in the same column.
+    ///   - `word_next`: to the cell before the next word (`w` in Helix),
+    ///     or to the last cell of the word when the next word is on another
+    ///     row.
+    ///   - `word_end`: to the end of the current or next word (`e`).
+    ///   - `word_prev`: to the start of the current or previous word (`b`).
+    ///   - `next_word_start`: to the first cell of the next word (`w` in
+    ///     Vim).
+    ///   - `line_start`, `line_end`: the first cell of the row, or its last
+    ///     cell with text.
+    ///   - `page_up`, `page_down`, `half_page_up`, `half_page_down`: a
+    ///     screen or half a screen of rows.
+    ///   - `top`, `bottom`: the first cell of the screen, or its last cell
+    ///     with text.
+    ///
+    /// A word is a run of cells that are all in `selection-word-chars` or
+    /// all not. Blanks and the end of a row that does not wrap are not part
+    /// of a word.
+    move_selection: SelectionMotion,
+
+    /// Move the selection head by a motion and keep the anchor, so the
+    /// selection grows or shrinks, as a motion in Helix select mode. Starts
+    /// a selection at the terminal cursor when there is none. See
+    /// `move_selection` for the motions.
+    extend_selection: SelectionMotion,
+
+    /// Select what a word motion of Helix moves over, as `w`, `e` and `b`
+    /// do in the normal mode of Helix: the head goes where `move_selection`
+    /// takes it, and the anchor goes to the cursor cell, or to the cell
+    /// after it (before it, for `prev`) when the cursor is already on a
+    /// word boundary, so a repeated motion moves on. Line ends between the
+    /// cursor and the word are left out. Starts a selection at the terminal
+    /// cursor when there is none. Does nothing when the motion cannot move.
+    ///
+    /// Valid motions are:
+    ///
+    ///   - `next`: the word after the cursor and the blanks after it (`w`).
+    ///   - `end`: to the end of the word (`e`).
+    ///   - `prev`: back to the start of the word (`b`).
+    select_word: SelectionWordMotion,
+
+    /// Put the anchor of the selection on its head, so the selection is one
+    /// cell. Does nothing when there is no selection.
+    collapse_selection,
+
+    /// Swap the anchor and the head of the selection. Does nothing when
+    /// there is no selection.
+    flip_selection,
+
+    /// Grow the selection to whole rows, as `x` does in Helix. The anchor
+    /// goes to the start of its row and the head to the end of its row, with
+    /// the head below the anchor. Rows that soft-wrap are one line. A
+    /// selection that already covers whole rows grows by one row at the
+    /// bottom. Starts a selection at the terminal cursor when there is none.
+    select_line,
+
+    /// Grow the selection to whole rows and keep its direction, as `V` does
+    /// in Vim and `X` in Helix. The end that is above goes to the start of
+    /// its row and the end that is below to the end of its row, and each
+    /// stays the anchor or the head that it was. Rows that soft-wrap are one
+    /// line. A selection that already covers whole rows does not change.
+    /// Starts a selection at the terminal cursor when there is none.
+    select_line_bounds,
+
+    /// Make the selection a rectangle (`on`), the block selection of Vim
+    /// (`Ctrl-v`), or lines again (`off`). The anchor and the head are two
+    /// corners. Starts a selection at the terminal cursor when there is
+    /// none. Does nothing when the state is already the one asked for.
+    selection_rectangle: SelectionRectangle,
+
+    /// Clear the selection. Does nothing when there is no selection.
+    clear_selection,
+
+    /// Draw the cursor on the head of the selection (`on`), or on the
+    /// cursor of the program again (`off`). While it is on, the cursor is
+    /// a steady block on the head, shown even while the program hides its
+    /// own cursor, and a one-cell selection draws as that cursor alone, as
+    /// in Helix. The cursor of the program does not move. This is the
+    /// cursor of a keyboard copy mode. Does nothing when the state is
+    /// already the one asked for.
+    selection_cursor: SelectionCursor,
+
     /// Jump the viewport forward or back by the given number of prompts.
     ///
     /// Requires shell integration.
@@ -1049,6 +1144,41 @@ pub const Action = union(enum) {
         end_of_line,
     };
 
+    pub const SelectionCursor = enum {
+        on,
+        off,
+    };
+
+    pub const SelectionMotion = enum {
+        left,
+        right,
+        up,
+        down,
+        word_next,
+        word_end,
+        word_prev,
+        next_word_start,
+        line_start,
+        line_end,
+        page_up,
+        page_down,
+        half_page_up,
+        half_page_down,
+        top,
+        bottom,
+    };
+
+    pub const SelectionRectangle = enum {
+        on,
+        off,
+    };
+
+    pub const SelectionWordMotion = enum {
+        next,
+        end,
+        prev,
+    };
+
     pub const SplitDirection = enum {
         right,
         down,
@@ -1414,6 +1544,17 @@ pub const Action = union(enum) {
             .scroll_page_fractional,
             .scroll_page_lines,
             .adjust_selection,
+            .start_selection,
+            .move_selection,
+            .extend_selection,
+            .select_word,
+            .collapse_selection,
+            .flip_selection,
+            .select_line,
+            .select_line_bounds,
+            .selection_rectangle,
+            .clear_selection,
+            .selection_cursor,
             .jump_to_prompt,
             .write_scrollback_file,
             .write_screen_file,
@@ -4640,6 +4781,80 @@ test "parse: write screen file invalid" {
     try testing.expectError(Error.InvalidFormat, parseSingle(
         "a=write_screen_file:copy,html,extra",
     ));
+}
+
+test "parse: move_selection and extend_selection" {
+    const testing = std.testing;
+
+    {
+        const binding = try parseSingle("a=move_selection:word_next");
+        try testing.expect(binding.action == .move_selection);
+        try testing.expectEqual(
+            Action.SelectionMotion.word_next,
+            binding.action.move_selection,
+        );
+    }
+
+    {
+        const binding = try parseSingle("a=extend_selection:half_page_down");
+        try testing.expect(binding.action == .extend_selection);
+        try testing.expectEqual(
+            Action.SelectionMotion.half_page_down,
+            binding.action.extend_selection,
+        );
+    }
+
+    try testing.expectError(Error.InvalidFormat, parseSingle(
+        "a=move_selection:sideways",
+    ));
+}
+
+test "parse: next_word_start, select_line_bounds and selection_rectangle" {
+    const testing = std.testing;
+
+    {
+        const binding = try parseSingle("a=move_selection:next_word_start");
+        try testing.expectEqual(Action.SelectionMotion.next_word_start, binding.action.move_selection);
+    }
+    try testing.expect((try parseSingle("a=select_line_bounds")).action == .select_line_bounds);
+    {
+        const binding = try parseSingle("a=selection_rectangle:on");
+        try testing.expectEqual(Action.SelectionRectangle.on, binding.action.selection_rectangle);
+    }
+    try testing.expectError(Error.InvalidFormat, parseSingle("a=selection_rectangle:sideways"));
+}
+
+test "parse: select_word" {
+    const testing = std.testing;
+
+    {
+        const binding = try parseSingle("a=select_word:next");
+        try testing.expectEqual(Action.SelectionWordMotion.next, binding.action.select_word);
+    }
+    {
+        const binding = try parseSingle("a=select_word:prev");
+        try testing.expectEqual(Action.SelectionWordMotion.prev, binding.action.select_word);
+    }
+    try testing.expectError(Error.InvalidFormat, parseSingle("a=select_word:word_next"));
+}
+
+test "parse: selection_cursor" {
+    const testing = std.testing;
+
+    const binding = try parseSingle("a=selection_cursor:on");
+    try testing.expect(binding.action == .selection_cursor);
+    try testing.expectEqual(Action.SelectionCursor.on, binding.action.selection_cursor);
+    try testing.expectError(Error.InvalidFormat, parseSingle("a=selection_cursor:maybe"));
+}
+
+test "parse: selection actions without a parameter" {
+    const testing = std.testing;
+
+    try testing.expect((try parseSingle("a=start_selection")).action == .start_selection);
+    try testing.expect((try parseSingle("a=collapse_selection")).action == .collapse_selection);
+    try testing.expect((try parseSingle("a=flip_selection")).action == .flip_selection);
+    try testing.expect((try parseSingle("a=select_line")).action == .select_line);
+    try testing.expect((try parseSingle("a=clear_selection")).action == .clear_selection);
 }
 
 test "action: format" {
