@@ -1,4 +1,4 @@
-From 28938ac2b7d44814df1b22132f939162c08c89f0 Mon Sep 17 00:00:00 2001
+From ae7122a336f6036496cd24ea722202366830634a Mon Sep 17 00:00:00 2001
 From: Ethan Lee <ethantlee21@gmail.com>
 Date: Tue, 13 Oct 2026 01:11:48 -0400
 Subject: [PATCH] embedded: let the host give a surface its size at creation
@@ -21,11 +21,11 @@ hosts are unchanged.
  2 files changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 42fd131ea..7051de427 100644
+index 9c2825320..dfecc109c 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
-@@ -521,6 +521,8 @@ typedef struct {
-   const char* const* command_wrapper;
+@@ -537,6 +537,8 @@ typedef struct {
+   const char* GHOSTTY_NULLABLE const* GHOSTTY_NULLABLE command_wrapper;
    size_t command_wrapper_count;
    bool disable_shell_integration;
 +  uint32_t initial_width_px;
@@ -34,7 +34,7 @@ index 42fd131ea..7051de427 100644
  
  typedef struct {
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index fb47c66f6..83148e2cd 100644
+index 7de4f5da8..bfc4ad89f 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -512,6 +512,17 @@ pub const Surface = struct {

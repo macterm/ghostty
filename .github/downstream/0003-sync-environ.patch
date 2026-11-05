@@ -1,4 +1,4 @@
-From 8f22e57246bf12cdf5e16abbc5070bd1a6d1749c Mon Sep 17 00:00:00 2001
+From be64d94dfdba14ae469d944898fb9a5f1c233637 Mon Sep 17 00:00:00 2001
 From: Ethan Lee <ethantlee21@gmail.com>
 Date: Tue, 28 Jul 2026 14:54:29 +0900
 Subject: [PATCH] main_c: export ghostty_sync_environ for embedders that mutate
@@ -24,19 +24,19 @@ but the C API offered embedders no equivalent. Export it.
  2 files changed, 18 insertions(+)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
-index cbbec0026..93ff3d6e4 100644
+index 2353f417d..425200ef5 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
-@@ -1067,6 +1067,7 @@ typedef enum {
+@@ -1158,6 +1158,7 @@ typedef enum {
  // Published API
  
- GHOSTTY_API int ghostty_init(uintptr_t, char**);
+ GHOSTTY_API int ghostty_init(uintptr_t, char* GHOSTTY_NULLABLE* GHOSTTY_NONNULL);
 +GHOSTTY_API void ghostty_sync_environ(void);
  GHOSTTY_API void ghostty_cli_try_action(void);
  GHOSTTY_API ghostty_info_s ghostty_info(void);
  GHOSTTY_API const char* ghostty_translate(const char*);
 diff --git a/src/main_c.zig b/src/main_c.zig
-index 3e331e022..924f055a2 100644
+index 9d926c316..4c1b95f61 100644
 --- a/src/main_c.zig
 +++ b/src/main_c.zig
 @@ -134,6 +134,23 @@ pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
@@ -64,5 +64,5 @@ index 3e331e022..924f055a2 100644
  /// false. If there is an action then this doesn't return.
  pub export fn ghostty_cli_try_action() void {
 -- 
-2.53.0
+2.54.0 (Apple Git-157)
 
