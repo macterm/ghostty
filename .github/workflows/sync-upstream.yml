@@ -60,6 +60,7 @@ env:
     .github/downstream/0017-selection-helix-words.patch
     .github/downstream/0018-selection-scroll-ease.patch
     .github/downstream/0019-command-text.patch
+    .github/downstream/0020-unknown-apc.patch
 
 jobs:
   sync:
