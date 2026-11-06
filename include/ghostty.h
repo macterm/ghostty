@@ -943,7 +943,7 @@ typedef struct {
   uint64_t duration;
   // the command as typed at the prompt (the OSC 133 input cells), or NULL
   // when the shell marked no input. Valid for the action only.
-  const char* command;
+  const char* GHOSTTY_NULLABLE command;
 } ghostty_action_command_finished_s;
 
 // apprt.action.StartSearch.C
