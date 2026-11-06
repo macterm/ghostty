@@ -3688,11 +3688,12 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
 }
 
 /// The text the user typed at the latest prompt: the input cells of the
-/// prompt at or above the cursor, unwrapped and trimmed, as one string
-/// (fork patch 0019). null when the shell never marked a prompt, when no
-/// prompt is above the cursor, or when the input is empty. A continuation
-/// prompt between two input rows stays in the text, because the input
-/// zone spans it.
+/// prompt at or above the cursor, unwrapped, as one string (fork patch
+/// 0019). null when the shell never marked a prompt, when no prompt is
+/// above the cursor, or when the input has no text. Not trimmed: a
+/// leading space is the shells' `HISTCONTROL=ignorespace` sign, which the
+/// embedder reads. A continuation prompt between two input rows stays in
+/// the text, because the input zone spans it.
 ///
 /// Read at OSC 133;C (the start of the output), while the input is still
 /// on the screen: a command that clears the screen, or that prints more
@@ -3707,9 +3708,9 @@ pub fn commandInputString(
     const hl = self.pages.highlightSemanticContent(prompt_pin, .input) orelse return null;
     const text = try self.selectionString(alloc, .{
         .sel = .init(hl.start, hl.end, false),
-        .trim = true,
+        .trim = false,
     });
-    if (text.len == 0) {
+    if (std.mem.trim(u8, text, " ").len == 0) {
         alloc.free(text);
         return null;
     }
@@ -13180,16 +13181,17 @@ test "Screen: command input string" {
     try testing.expect((try s.commandInputString(alloc)) == null);
 
     // A prompt, a typed command, then the output starts on the next row:
-    // the input alone, trimmed, without the prompt.
+    // the input alone, as typed, without the prompt. The spaces stay: a
+    // leading one is the shells' sign for a private command.
     s.cursorSetSemanticContent(.{ .prompt = .initial });
     try s.testWriteString("$ ");
     s.cursorSetSemanticContent(.{ .input = .clear_explicit });
-    try s.testWriteString("make test  \n");
+    try s.testWriteString(" make test  \n");
     s.cursorSetSemanticContent(.output);
     {
         const text = (try s.commandInputString(alloc)).?;
         defer alloc.free(text);
-        try testing.expectEqualStrings("make test", text);
+        try testing.expectEqualStrings(" make test  ", text);
     }
 
     // Output, then a prompt with nothing typed: null, not the previous command.
