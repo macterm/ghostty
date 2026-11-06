@@ -3687,6 +3687,35 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
     return .init(hl.start, hl.end, false);
 }
 
+/// The text the user typed at the latest prompt: the input cells of the
+/// prompt at or above the cursor, unwrapped and trimmed, as one string
+/// (fork patch 0019). null when the shell never marked a prompt, when no
+/// prompt is above the cursor, or when the input is empty. A continuation
+/// prompt between two input rows stays in the text, because the input
+/// zone spans it.
+///
+/// Read at OSC 133;C (the start of the output), while the input is still
+/// on the screen: a command that clears the screen, or that prints more
+/// than a screen, takes it away before 133;D. The caller owns the string.
+pub fn commandInputString(
+    self: *Screen,
+    alloc: Allocator,
+) Allocator.Error!?[:0]const u8 {
+    if (!self.semantic_prompt.seen) return null;
+    var it = self.cursor.page_pin.promptIterator(.left_up, null);
+    const prompt_pin = it.next() orelse return null;
+    const hl = self.pages.highlightSemanticContent(prompt_pin, .input) orelse return null;
+    const text = try self.selectionString(alloc, .{
+        .sel = .init(hl.start, hl.end, false),
+        .trim = true,
+    });
+    if (text.len == 0) {
+        alloc.free(text);
+        return null;
+    }
+    return text;
+}
+
 pub const LineIterator = struct {
     screen: *const Screen,
     current: ?Pin = null,
@@ -13135,5 +13164,52 @@ test "Screen: scrollClear cursor page pruned keeps per-page hyperlink id" {
     {
         const list_cell = s.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
         try testing.expect(list_cell.cell.hyperlink);
+    }
+}
+
+test "Screen: command input string" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // No prompt was ever marked: nothing.
+    try s.testWriteString("plain output\n");
+    try testing.expect((try s.commandInputString(alloc)) == null);
+
+    // A prompt, a typed command, then the output starts on the next row:
+    // the input alone, trimmed, without the prompt.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("make test  \n");
+    s.cursorSetSemanticContent(.output);
+    {
+        const text = (try s.commandInputString(alloc)).?;
+        defer alloc.free(text);
+        try testing.expectEqualStrings("make test", text);
+    }
+
+    // Output, then a prompt with nothing typed: null, not the previous command.
+    try s.testWriteString("ok\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("\n");
+    s.cursorSetSemanticContent(.output);
+    try testing.expect((try s.commandInputString(alloc)) == null);
+
+    // A command that wraps onto a second row comes back unwrapped.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("echo 123456789012345678\n");
+    s.cursorSetSemanticContent(.output);
+    {
+        const text = (try s.commandInputString(alloc)).?;
+        defer alloc.free(text);
+        try testing.expectEqualStrings("echo 123456789012345678", text);
     }
 }

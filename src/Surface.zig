@@ -180,6 +180,9 @@ readonly: bool = false,
 /// actual time, but we must be able to compare two subsequent timestamps to get
 /// the wall clock time that has elapsed between timestamps.
 command_timer: ?std.Io.Timestamp = null,
+/// The command that `command_timer` times, read at its start (fork patch
+/// 0019): the input cells of the prompt, while they are still on the screen.
+command_text: ?[:0]const u8 = null,
 
 /// Search state
 search: ?Search = null,
@@ -839,6 +842,7 @@ pub fn deinit(self: *Surface) void {
 
     // Stop search thread
     if (self.search) |*s| s.deinit();
+    if (self.command_text) |t| self.alloc.free(t);
 
     // Stop rendering thread
     {
@@ -1205,6 +1209,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .start_command => {
             self.command_timer = .now(global.io(), .awake);
+            // The command's text, now: a command that clears the screen or
+            // prints more than a screen takes it away before it ends.
+            if (self.command_text) |t| self.alloc.free(t);
+            self.command_text = text: {
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                break :text self.io.terminal.screens.active.commandInputString(self.alloc) catch null;
+            };
         },
 
         .stop_command => |v| timer: {
@@ -1222,12 +1234,18 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
             log.debug("command took {f}", .{duration});
 
+            const command = self.command_text;
+            defer {
+                if (command) |t| self.alloc.free(t);
+                self.command_text = null;
+            }
             _ = self.rt_app.performAction(
                 .{ .surface = self },
                 .command_finished,
                 .{
                     .exit_code = v,
                     .duration = duration,
+                    .command = command,
                 },
             ) catch |err| {
                 log.warn("apprt failed to notify command finish={}", .{err});

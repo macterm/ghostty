@@ -941,6 +941,9 @@ typedef struct {
   int16_t exit_code;
   // number of nanoseconds that command was running for
   uint64_t duration;
+  // the command as typed at the prompt (the OSC 133 input cells), or NULL
+  // when the shell marked no input. Valid for the action only.
+  const char* command;
 } ghostty_action_command_finished_s;
 
 // apprt.action.StartSearch.C

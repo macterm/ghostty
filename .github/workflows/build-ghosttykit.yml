@@ -99,7 +99,7 @@ jobs:
       # "parse:" covers the keybind parser, which every new binding action
       # goes through.
       - name: Test downstream patches
-        run: zig build test -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="viewport eases" -Dtest-filter="parse:"
+        run: zig build test -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="viewport eases" -Dtest-filter="command input" -Dtest-filter="parse:"
 
       - name: Build xcframework
         run: zig build -Doptimize=ReleaseFast -Dsentry=false -Demit-xcframework=true -Dxcframework-target=universal -Demit-macos-app=false -Demit-themes=true
