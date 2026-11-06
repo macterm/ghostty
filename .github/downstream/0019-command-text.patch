@@ -1,0 +1,191 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index dfecc109c..242edf194 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -941,6 +941,9 @@ typedef struct {
+   int16_t exit_code;
+   // number of nanoseconds that command was running for
+   uint64_t duration;
++  // the command as typed at the prompt (the OSC 133 input cells), or NULL
++  // when the shell marked no input. Valid for the action only.
++  const char* command;
+ } ghostty_action_command_finished_s;
+ 
+ // apprt.action.StartSearch.C
+diff --git a/src/Surface.zig b/src/Surface.zig
+index b9e599d84..f8056541d 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -180,6 +180,9 @@ readonly: bool = false,
+ /// actual time, but we must be able to compare two subsequent timestamps to get
+ /// the wall clock time that has elapsed between timestamps.
+ command_timer: ?std.Io.Timestamp = null,
++/// The command that `command_timer` times, read at its start (fork patch
++/// 0019): the input cells of the prompt, while they are still on the screen.
++command_text: ?[:0]const u8 = null,
+ 
+ /// Search state
+ search: ?Search = null,
+@@ -839,6 +842,7 @@ pub fn deinit(self: *Surface) void {
+ 
+     // Stop search thread
+     if (self.search) |*s| s.deinit();
++    if (self.command_text) |t| self.alloc.free(t);
+ 
+     // Stop rendering thread
+     {
+@@ -1205,6 +1209,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
+ 
+         .start_command => {
+             self.command_timer = .now(global.io(), .awake);
++            // The command's text, now: a command that clears the screen or
++            // prints more than a screen takes it away before it ends.
++            if (self.command_text) |t| self.alloc.free(t);
++            self.command_text = text: {
++                self.renderer_state.mutex.lockUncancelable(global.io());
++                defer self.renderer_state.mutex.unlock(global.io());
++                break :text self.io.terminal.screens.active.commandInputString(self.alloc) catch null;
++            };
+         },
+ 
+         .stop_command => |v| timer: {
+@@ -1222,12 +1234,18 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
+             };
+             log.debug("command took {f}", .{duration});
+ 
++            const command = self.command_text;
++            defer {
++                if (command) |t| self.alloc.free(t);
++                self.command_text = null;
++            }
+             _ = self.rt_app.performAction(
+                 .{ .surface = self },
+                 .command_finished,
+                 .{
+                     .exit_code = v,
+                     .duration = duration,
++                    .command = command,
+                 },
+             ) catch |err| {
+                 log.warn("apprt failed to notify command finish={}", .{err});
+diff --git a/src/apprt/action.zig b/src/apprt/action.zig
+index c63f6efe6..793071322 100644
+--- a/src/apprt/action.zig
++++ b/src/apprt/action.zig
+@@ -1022,17 +1022,23 @@ pub const CloseTabMode = enum(c_int) {
+ pub const CommandFinished = struct {
+     exit_code: ?u8,
+     duration: configpkg.Config.Duration,
++    /// The command as typed at the prompt, from the input cells of the
++    /// prompt (fork patch 0019, `Screen.commandInputString`). null when
++    /// the shell marked no input. Valid for the action only.
++    command: ?[:0]const u8 = null,
+ 
+     /// sync with ghostty_action_command_finished_s in ghostty.h
+     pub const C = extern struct {
+         exit_code: i16,
+         duration: u64,
++        command: ?[*:0]const u8,
+     };
+ 
+     pub fn cval(self: CommandFinished) C {
+         return .{
+             .exit_code = self.exit_code orelse -1,
+             .duration = self.duration.duration,
++            .command = if (self.command) |c| c.ptr else null,
+         };
+     }
+ };
+diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
+index 7415136a6..03da01256 100644
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -3687,6 +3687,36 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
+     return .init(hl.start, hl.end, false);
+ }
+ 
++/// The text the user typed at the latest prompt: the input cells of the
++/// prompt at or above the cursor, unwrapped, as one string (fork patch
++/// 0019). null when the shell never marked a prompt, when no prompt is
++/// above the cursor, or when the input has no text. Not trimmed: a
++/// leading space is the shells' `HISTCONTROL=ignorespace` sign, which the
++/// embedder reads. A continuation prompt between two input rows stays in
++/// the text, because the input zone spans it.
++///
++/// Read at OSC 133;C (the start of the output), while the input is still
++/// on the screen: a command that clears the screen, or that prints more
++/// than a screen, takes it away before 133;D. The caller owns the string.
++pub fn commandInputString(
++    self: *Screen,
++    alloc: Allocator,
++) Allocator.Error!?[:0]const u8 {
++    if (!self.semantic_prompt.seen) return null;
++    var it = self.cursor.page_pin.promptIterator(.left_up, null);
++    const prompt_pin = it.next() orelse return null;
++    const hl = self.pages.highlightSemanticContent(prompt_pin, .input) orelse return null;
++    const text = try self.selectionString(alloc, .{
++        .sel = .init(hl.start, hl.end, false),
++        .trim = false,
++    });
++    if (std.mem.trim(u8, text, " ").len == 0) {
++        alloc.free(text);
++        return null;
++    }
++    return text;
++}
++
+ pub const LineIterator = struct {
+     screen: *const Screen,
+     current: ?Pin = null,
+@@ -13137,3 +13167,51 @@ test "Screen: scrollClear cursor page pruned keeps per-page hyperlink id" {
+         try testing.expect(list_cell.cell.hyperlink);
+     }
+ }
++
++test "Screen: command input string" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    const io = testing.io;
++
++    var s = try init(io, alloc, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
++    defer s.deinit();
++
++    // No prompt was ever marked: nothing.
++    try s.testWriteString("plain output\n");
++    try testing.expect((try s.commandInputString(alloc)) == null);
++
++    // A prompt, a typed command, then the output starts on the next row:
++    // the input alone, as typed, without the prompt. The spaces stay: a
++    // leading one is the shells' sign for a private command.
++    s.cursorSetSemanticContent(.{ .prompt = .initial });
++    try s.testWriteString("$ ");
++    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
++    try s.testWriteString(" make test  \n");
++    s.cursorSetSemanticContent(.output);
++    {
++        const text = (try s.commandInputString(alloc)).?;
++        defer alloc.free(text);
++        try testing.expectEqualStrings(" make test  ", text);
++    }
++
++    // Output, then a prompt with nothing typed: null, not the previous command.
++    try s.testWriteString("ok\n");
++    s.cursorSetSemanticContent(.{ .prompt = .initial });
++    try s.testWriteString("$ ");
++    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
++    try s.testWriteString("\n");
++    s.cursorSetSemanticContent(.output);
++    try testing.expect((try s.commandInputString(alloc)) == null);
++
++    // A command that wraps onto a second row comes back unwrapped.
++    s.cursorSetSemanticContent(.{ .prompt = .initial });
++    try s.testWriteString("$ ");
++    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
++    try s.testWriteString("echo 123456789012345678\n");
++    s.cursorSetSemanticContent(.output);
++    {
++        const text = (try s.commandInputString(alloc)).?;
++        defer alloc.free(text);
++        try testing.expectEqualStrings("echo 123456789012345678", text);
++    }
++}

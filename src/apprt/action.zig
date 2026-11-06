@@ -1022,17 +1022,23 @@ pub const CloseTabMode = enum(c_int) {
 pub const CommandFinished = struct {
     exit_code: ?u8,
     duration: configpkg.Config.Duration,
+    /// The command as typed at the prompt, from the input cells of the
+    /// prompt (fork patch 0019, `Screen.commandInputString`). null when
+    /// the shell marked no input. Valid for the action only.
+    command: ?[:0]const u8 = null,
 
     /// sync with ghostty_action_command_finished_s in ghostty.h
     pub const C = extern struct {
         exit_code: i16,
         duration: u64,
+        command: ?[*:0]const u8,
     };
 
     pub fn cval(self: CommandFinished) C {
         return .{
             .exit_code = self.exit_code orelse -1,
             .duration = self.duration.duration,
+            .command = if (self.command) |c| c.ptr else null,
         };
     }
 };
