@@ -134,6 +134,11 @@ pub const Message = union(enum) {
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 
+    /// An APC sequence that no protocol recognizes ended (see
+    /// `apprt.action.UnknownApc`). The surface frees the request after
+    /// the action.
+    unknown_apc: UnknownApcReq,
+
     /// The terminal encountered a bell character.
     ring_bell,
 
@@ -168,6 +173,11 @@ pub const Message = union(enum) {
 
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
+
+    pub const UnknownApcReq = struct {
+        data: WriteReq,
+        truncated: bool,
+    };
 
     pub const ReportTitleStyle = enum {
         csi_21_t,

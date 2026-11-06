@@ -946,6 +946,16 @@ typedef struct {
   const char* GHOSTTY_NULLABLE command;
 } ghostty_action_command_finished_s;
 
+// apprt.action.UnknownApc.C
+typedef struct {
+  // The APC payload between ESC _ and ST, without the framing. Not NUL
+  // terminated, and valid for the action only.
+  const char* data;
+  size_t len;
+  // true when the payload was cut at the capture limit.
+  bool truncated;
+} ghostty_action_unknown_apc_s;
+
 // apprt.action.StartSearch.C
 typedef struct {
   const char* needle;
@@ -1041,6 +1051,7 @@ typedef enum {
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_OUTPUT_ACTIVITY,
+  GHOSTTY_ACTION_UNKNOWN_APC,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1081,6 +1092,7 @@ typedef union {
   ghostty_surface_message_childexited_s child_exited;
   ghostty_action_progress_report_s progress_report;
   ghostty_action_command_finished_s command_finished;
+  ghostty_action_unknown_apc_s unknown_apc;
   ghostty_action_start_search_s start_search;
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;

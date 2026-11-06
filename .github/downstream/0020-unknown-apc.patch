@@ -1,0 +1,271 @@
+From 9d84a57235f37fa6e7c4c540d49e83f5c7b1cd6a Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Fri, 6 Nov 2026 11:28:50 -0500
+Subject: [PATCH] apprt: raise an APC that no protocol recognizes as an action,
+ so that an embedder can take a private report from a program in the pty
+
+The terminal already captures the payload of an APC that is not Kitty
+graphics or the glyph protocol (`apc.Handler.unknown_max_bytes`), but the
+stream handler drops it. Nothing in the pty can therefore tell the
+embedder anything that a title, a notification or a pwd does not say.
+
+Macterm's zmx fork reports the foreground process of a session to the
+attached client as such an APC, so that the tab name, the busy-close
+guard and the agent logo of a remote pane follow the host at once, in
+the order of the output, in place of a polled ssh probe. APC is the
+right carrier: no keyboard produces one, a terminal that does not know
+it discards it, and it rides the pane's own connection.
+
+The handler keeps at most `unknown_apc_max_bytes` (4 KiB) of such a
+payload and reports it through the surface mailbox as a write request,
+the way a pwd change travels. The surface raises `unknown_apc` with the
+bytes and the cut flag, and frees the request after the action. The
+native apprts take the action as a no-op. The tag is appended last in
+both enums, so the existing values do not change.
+---
+ include/ghostty.h                       | 12 +++++++
+ macos/Sources/Ghostty/Ghostty.App.swift |  4 +++
+ src/Surface.zig                         | 11 +++++++
+ src/apprt/action.zig                    | 42 +++++++++++++++++++++++++
+ src/apprt/gtk/class/application.zig     |  3 ++
+ src/apprt/surface.zig                   | 10 ++++++
+ src/termio/stream_handler.zig           | 22 +++++++++++--
+ 7 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 41ad0e164..e0160edd6 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -946,6 +946,16 @@ typedef struct {
+   const char* GHOSTTY_NULLABLE command;
+ } ghostty_action_command_finished_s;
+ 
++// apprt.action.UnknownApc.C
++typedef struct {
++  // The APC payload between ESC _ and ST, without the framing. Not NUL
++  // terminated, and valid for the action only.
++  const char* data;
++  size_t len;
++  // true when the payload was cut at the capture limit.
++  bool truncated;
++} ghostty_action_unknown_apc_s;
++
+ // apprt.action.StartSearch.C
+ typedef struct {
+   const char* needle;
+@@ -1041,6 +1051,7 @@ typedef enum {
+   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+   GHOSTTY_ACTION_RESIZE_WINDOW,
+   GHOSTTY_ACTION_OUTPUT_ACTIVITY,
++  GHOSTTY_ACTION_UNKNOWN_APC,
+ } ghostty_action_tag_e;
+ 
+ typedef union {
+@@ -1081,6 +1092,7 @@ typedef union {
+   ghostty_surface_message_childexited_s child_exited;
+   ghostty_action_progress_report_s progress_report;
+   ghostty_action_command_finished_s command_finished;
++  ghostty_action_unknown_apc_s unknown_apc;
+   ghostty_action_start_search_s start_search;
+   ghostty_action_search_total_s search_total;
+   ghostty_action_search_selected_s search_selected;
+diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
+index 680cdcf80..eded393a1 100644
+--- a/macos/Sources/Ghostty/Ghostty.App.swift
++++ b/macos/Sources/Ghostty/Ghostty.App.swift
+@@ -745,6 +745,10 @@ extension Ghostty {
+             case GHOSTTY_ACTION_OUTPUT_ACTIVITY:
+                 break
+ 
++            // Reserved for embedders with a private APC contract.
++            case GHOSTTY_ACTION_UNKNOWN_APC:
++                break
++
+             case GHOSTTY_ACTION_CLOSE_ALL_WINDOWS:
+                 closeAllWindows(app, target: target)
+ 
+diff --git a/src/Surface.zig b/src/Surface.zig
+index f8056541d..7215ffbfd 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -1134,6 +1134,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
+             },
+         },
+ 
++        .unknown_apc => |req| {
++            defer req.data.deinit();
++            _ = self.rt_app.performAction(
++                .{ .surface = self },
++                .unknown_apc,
++                .{ .data = req.data.slice(), .truncated = req.truncated },
++            ) catch |err| {
++                log.warn("apprt failed to notify of an unknown apc err={}", .{err});
++            };
++        },
++
+         .pwd_change => |w| {
+             defer w.deinit();
+ 
+diff --git a/src/apprt/action.zig b/src/apprt/action.zig
+index 793071322..4acd47638 100644
+--- a/src/apprt/action.zig
++++ b/src/apprt/action.zig
+@@ -374,6 +374,15 @@ pub const Action = union(Key) {
+     /// geometry, matching `scrollbar`.
+     output_activity: terminal.Scrollbar,
+ 
++    /// The program sent an APC sequence that no protocol of the
++    /// terminal recognizes. The payload is given as it arrived,
++    /// without the `ESC _` and `ST` framing, cut at
++    /// `StreamHandler.unknown_apc_max_bytes`. The terminal itself
++    /// discards such a sequence, so this is for an embedder with a
++    /// private contract with a program in the pty: Macterm's zmx fork
++    /// reports the foreground process of a session this way.
++    unknown_apc: UnknownApc,
++
+     /// Sync with: ghostty_action_tag_e
+     pub const Key = enum(c_int) {
+         quit,
+@@ -447,6 +456,7 @@ pub const Action = union(Key) {
+         move_tab_to_new_window,
+         resize_window,
+         output_activity,
++        unknown_apc,
+ 
+         test "ghostty.h Action.Key" {
+             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
+@@ -1043,6 +1053,38 @@ pub const CommandFinished = struct {
+     }
+ };
+ 
++pub const UnknownApc = struct {
++    /// The APC payload, without the framing. Borrowed: valid for the
++    /// action only.
++    data: []const u8,
++    /// The payload was cut at the capture limit.
++    truncated: bool,
++
++    // Sync with: ghostty_action_unknown_apc_s
++    pub const C = extern struct {
++        data: [*]const u8,
++        len: usize,
++        truncated: bool,
++    };
++
++    pub fn cval(self: UnknownApc) C {
++        return .{
++            .data = self.data.ptr,
++            .len = self.data.len,
++            .truncated = self.truncated,
++        };
++    }
++
++    test "unknown apc: the C value carries the bytes and the cut flag" {
++        const testing = std.testing;
++        const payload = "zmx;foreground;1;1;zsh;-zsh";
++        const c = (UnknownApc{ .data = payload, .truncated = true }).cval();
++        try testing.expectEqual(payload.len, c.len);
++        try testing.expectEqualStrings(payload, c.data[0..c.len]);
++        try testing.expect(c.truncated);
++    }
++};
++
+ pub const StartSearch = struct {
+     needle: [:0]const u8,
+ 
+diff --git a/src/apprt/gtk/class/application.zig b/src/apprt/gtk/class/application.zig
+index 680261f63..26dba0b38 100644
+--- a/src/apprt/gtk/class/application.zig
++++ b/src/apprt/gtk/class/application.zig
+@@ -778,6 +778,9 @@ pub const Application = extern struct {
+             // Reserved for embedders that consume activity heartbeats.
+             .output_activity => {},
+ 
++            // Reserved for embedders with a private APC contract.
++            .unknown_apc => {},
++
+             .scrollbar => Action.scrollbar(target, value),
+ 
+             .set_title => Action.setTitle(target, value),
+diff --git a/src/apprt/surface.zig b/src/apprt/surface.zig
+index 16547e579..64faa1dfb 100644
+--- a/src/apprt/surface.zig
++++ b/src/apprt/surface.zig
+@@ -134,6 +134,11 @@ pub const Message = union(enum) {
+     /// The terminal has reported a change in the working directory.
+     pwd_change: WriteReq,
+ 
++    /// An APC sequence that no protocol recognizes ended (see
++    /// `apprt.action.UnknownApc`). The surface frees the request after
++    /// the action.
++    unknown_apc: UnknownApcReq,
++
+     /// The terminal encountered a bell character.
+     ring_bell,
+ 
+@@ -169,6 +174,11 @@ pub const Message = union(enum) {
+     /// Renderer pushed a new frame, redraw this surface.
+     redraw,
+ 
++    pub const UnknownApcReq = struct {
++        data: WriteReq,
++        truncated: bool,
++    };
++
+     pub const ReportTitleStyle = enum {
+         csi_21_t,
+ 
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 0c2781e70..80a88b029 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -16,6 +16,13 @@ const posix = std.posix;
+ 
+ const log = std.log.scoped(.io_handler);
+ 
++/// How much of an APC that no protocol recognizes is kept for
++/// `apprt.Action.unknown_apc`. The payload of such a sequence is a
++/// private contract between an embedder and a program in the pty (a
++/// zmx foreground report is a few hundred bytes), so the limit only
++/// bounds what a program can make the terminal allocate.
++pub const unknown_apc_max_bytes: usize = 4096;
++
+ /// This is used as the handler for the terminal.Stream type. This is
+ /// stateful and is expected to live for the entire lifetime of the terminal.
+ /// It is NOT VALID to stop a stream handler, create a new one, and use that
+@@ -66,7 +73,7 @@ pub const StreamHandler = struct {
+     /// CSI or OSC, but it is a private escape sequence that is used
+     /// to send commands to the terminal emulator. This is used by
+     /// the kitty graphics protocol.
+-    apc: terminal.apc.Handler = .{},
++    apc: terminal.apc.Handler = .{ .unknown_max_bytes = unknown_apc_max_bytes },
+ 
+     /// The DCS handler maintains DCS state. DCS is like CSI or OSC,
+     /// but requires more stateful parsing. This is used by functionality
+@@ -525,7 +532,7 @@ pub const StreamHandler = struct {
+ 
+         // log.warn("APC command: {}", .{result});
+         switch (result) {
+-            .unknown => return,
++            .unknown => |*unknown| self.unknownApc(unknown.content, unknown.truncated),
+             .kitty => |*kitty_cmd| {
+                 if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
+                     var buf: [1024]u8 = undefined;
+@@ -1844,6 +1851,17 @@ pub const StreamHandler = struct {
+         }
+     }
+ 
++    /// Report an APC that no protocol recognizes to the surface, which
++    /// raises it as `apprt.Action.unknown_apc`. The handler kept at most
++    /// `unknown_apc_max_bytes` of it.
++    fn unknownApc(self: *StreamHandler, content: []const u8, truncated: bool) void {
++        const req = apprt.surface.Message.WriteReq.init(self.alloc, content) catch |err| {
++            log.warn("error notifying surface of an unknown apc err={}", .{err});
++            return;
++        };
++        self.surfaceMessageWriter(.{ .unknown_apc = .{ .data = req, .truncated = truncated } });
++    }
++
+     fn showDesktopNotification(
+         self: *StreamHandler,
+         title: []const u8,

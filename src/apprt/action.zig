@@ -374,6 +374,15 @@ pub const Action = union(Key) {
     /// geometry, matching `scrollbar`.
     output_activity: terminal.Scrollbar,
 
+    /// The program sent an APC sequence that no protocol of the
+    /// terminal recognizes. The payload is given as it arrived,
+    /// without the `ESC _` and `ST` framing, cut at
+    /// `StreamHandler.unknown_apc_max_bytes`. The terminal itself
+    /// discards such a sequence, so this is for an embedder with a
+    /// private contract with a program in the pty: Macterm's zmx fork
+    /// reports the foreground process of a session this way.
+    unknown_apc: UnknownApc,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -447,6 +456,7 @@ pub const Action = union(Key) {
         move_tab_to_new_window,
         resize_window,
         output_activity,
+        unknown_apc,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1040,6 +1050,38 @@ pub const CommandFinished = struct {
             .duration = self.duration.duration,
             .command = if (self.command) |c| c.ptr else null,
         };
+    }
+};
+
+pub const UnknownApc = struct {
+    /// The APC payload, without the framing. Borrowed: valid for the
+    /// action only.
+    data: []const u8,
+    /// The payload was cut at the capture limit.
+    truncated: bool,
+
+    // Sync with: ghostty_action_unknown_apc_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+        truncated: bool,
+    };
+
+    pub fn cval(self: UnknownApc) C {
+        return .{
+            .data = self.data.ptr,
+            .len = self.data.len,
+            .truncated = self.truncated,
+        };
+    }
+
+    test "unknown apc: the C value carries the bytes and the cut flag" {
+        const testing = std.testing;
+        const payload = "zmx;foreground;1;1;zsh;-zsh";
+        const c = (UnknownApc{ .data = payload, .truncated = true }).cval();
+        try testing.expectEqual(payload.len, c.len);
+        try testing.expectEqualStrings(payload, c.data[0..c.len]);
+        try testing.expect(c.truncated);
     }
 };
 
