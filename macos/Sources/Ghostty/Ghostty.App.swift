@@ -745,6 +745,10 @@ extension Ghostty {
             case GHOSTTY_ACTION_OUTPUT_ACTIVITY:
                 break
 
+            // Reserved for embedders with a private APC contract.
+            case GHOSTTY_ACTION_UNKNOWN_APC:
+                break
+
             case GHOSTTY_ACTION_CLOSE_ALL_WINDOWS:
                 closeAllWindows(app, target: target)
 

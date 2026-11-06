@@ -1134,6 +1134,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             },
         },
 
+        .unknown_apc => |req| {
+            defer req.data.deinit();
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .unknown_apc,
+                .{ .data = req.data.slice(), .truncated = req.truncated },
+            ) catch |err| {
+                log.warn("apprt failed to notify of an unknown apc err={}", .{err});
+            };
+        },
+
         .pwd_change => |w| {
             defer w.deinit();
 

@@ -16,6 +16,13 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+/// How much of an APC that no protocol recognizes is kept for
+/// `apprt.Action.unknown_apc`. The payload of such a sequence is a
+/// private contract between an embedder and a program in the pty (a
+/// zmx foreground report is a few hundred bytes), so the limit only
+/// bounds what a program can make the terminal allocate.
+pub const unknown_apc_max_bytes: usize = 4096;
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -66,7 +73,7 @@ pub const StreamHandler = struct {
     /// CSI or OSC, but it is a private escape sequence that is used
     /// to send commands to the terminal emulator. This is used by
     /// the kitty graphics protocol.
-    apc: terminal.apc.Handler = .{},
+    apc: terminal.apc.Handler = .{ .unknown_max_bytes = unknown_apc_max_bytes },
 
     /// The DCS handler maintains DCS state. DCS is like CSI or OSC,
     /// but requires more stateful parsing. This is used by functionality
@@ -525,7 +532,7 @@ pub const StreamHandler = struct {
 
         // log.warn("APC command: {}", .{result});
         switch (result) {
-            .unknown => return,
+            .unknown => |*unknown| self.unknownApc(unknown.content, unknown.truncated),
             .kitty => |*kitty_cmd| {
                 if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
                     var buf: [1024]u8 = undefined;
@@ -1842,6 +1849,17 @@ pub const StreamHandler = struct {
             const msg = try termio.Message.writeReq(self.alloc, response.writer.buffered());
             self.messageWriter(msg);
         }
+    }
+
+    /// Report an APC that no protocol recognizes to the surface, which
+    /// raises it as `apprt.Action.unknown_apc`. The handler kept at most
+    /// `unknown_apc_max_bytes` of it.
+    fn unknownApc(self: *StreamHandler, content: []const u8, truncated: bool) void {
+        const req = apprt.surface.Message.WriteReq.init(self.alloc, content) catch |err| {
+            log.warn("error notifying surface of an unknown apc err={}", .{err});
+            return;
+        };
+        self.surfaceMessageWriter(.{ .unknown_apc = .{ .data = req, .truncated = truncated } });
     }
 
     fn showDesktopNotification(
