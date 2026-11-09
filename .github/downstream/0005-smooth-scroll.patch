@@ -1,5 +1,5 @@
 diff --git a/src/Surface.zig b/src/Surface.zig
-index 2cfcd7458..0850e25a1 100644
+index 6c4727063..a29c6d087 100644
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
 @@ -325,6 +325,7 @@ const DerivedConfig = struct {
@@ -364,7 +364,7 @@ index 2cfcd7458..0850e25a1 100644
  ///
  /// Precondition: the render_state mutex must be held.
 diff --git a/src/config/Config.zig b/src/config/Config.zig
-index b4ca8f74f..521454063 100644
+index 08db784bb..9e2b53936 100644
 --- a/src/config/Config.zig
 +++ b/src/config/Config.zig
 @@ -999,6 +999,25 @@ palette: Palette = .{},
@@ -436,7 +436,7 @@ index 3314db29f..dc03a9995 100644
      // If we are in preedit, then we always show the block cursor. We do
      // this even if the cursor is explicitly not visible because it shows
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index c2e71ee50..dde312a56 100644
+index adcd544f6..07335dbf9 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
 @@ -48,6 +48,98 @@ const DisplayLink = switch (builtin.target.os.tag) {
@@ -1953,7 +1953,7 @@ index 4e02b6336..3f54f8daf 100644
        uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);
    out.tex_coord = tex_coord;
 diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
-index 03757563d..3ff73c354 100644
+index ee2689f7c..f93d001c5 100644
 --- a/src/terminal/Screen.zig
 +++ b/src/terminal/Screen.zig
 @@ -61,6 +61,25 @@ saved_cursor: ?SavedCursor = null,
@@ -1982,7 +1982,7 @@ index 03757563d..3ff73c354 100644
  /// The charset state
  charset: CharsetState = .{},
  
-@@ -195,6 +214,56 @@ pub const Cursor = struct {
+@@ -207,6 +226,56 @@ pub const Cursor = struct {
  };
  
  /// Saved cursor state.
@@ -2039,7 +2039,7 @@ index 03757563d..3ff73c354 100644
  pub const SavedCursor = struct {
      x: size.CellCountInt,
      y: size.CellCountInt,
-@@ -1686,6 +1755,10 @@ pub const Scroll = union(enum) {
+@@ -1719,6 +1788,10 @@ pub const Scroll = union(enum) {
  pub inline fn scroll(self: *Screen, behavior: Scroll) void {
      defer self.assertIntegrity();
  
@@ -2051,10 +2051,10 @@ index 03757563d..3ff73c354 100644
          // No matter what, scrolling marks our image state as dirty since
          // it could move placements. If there are no placements or no images
 diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
-index 713e9bcc0..9d4c346df 100644
+index 3f311d2bc..590032658 100644
 --- a/src/terminal/Terminal.zig
 +++ b/src/terminal/Terminal.zig
-@@ -2446,6 +2446,10 @@ pub fn index(self: *Terminal) !void {
+@@ -3093,6 +3093,10 @@ pub fn index(self: *Terminal) !void {
              // present case is handled out of line so this hot path
              // only pays a count check (a load from a cache line we
              // already write, above).
@@ -2065,7 +2065,7 @@ index 713e9bcc0..9d4c346df 100644
              if (comptime build_options.kitty_graphics) {
                  if (screen.kitty_images.placements.count() != 0) {
                      @branchHint(.unlikely);
-@@ -2467,6 +2471,8 @@ pub fn index(self: *Terminal) !void {
+@@ -3114,6 +3118,8 @@ pub fn index(self: *Terminal) !void {
              return;
          }
  
@@ -2074,7 +2074,7 @@ index 713e9bcc0..9d4c346df 100644
          // Kitty image placements may need adjusting around the scroll;
          // handled out of line like the scrollback path above.
          if (comptime build_options.kitty_graphics) {
-@@ -2709,8 +2715,29 @@ pub fn setLeftAndRightMargin(self: *Terminal, left_req: usize, right_req: usize)
+@@ -3356,8 +3362,29 @@ pub fn setLeftAndRightMargin(self: *Terminal, left_req: usize, right_req: usize)
      self.setCursorPos(1, 1);
  }
  
@@ -2104,7 +2104,7 @@ index 713e9bcc0..9d4c346df 100644
      // Preserve our x/y to restore.
      const old_x = self.screens.active.cursor.x;
      const old_y = self.screens.active.cursor.y;
-@@ -2751,6 +2778,8 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
+@@ -3398,6 +3425,8 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
  ///
  /// Does not change the (absolute) cursor position.
  pub fn scrollUp(self: *Terminal, count: usize) !void {
@@ -2113,7 +2113,7 @@ index 713e9bcc0..9d4c346df 100644
      // Preserve our x/y to restore.
      const old_x = self.screens.active.cursor.x;
      const old_y = self.screens.active.cursor.y;
-@@ -9236,6 +9265,49 @@ test "Terminal: insertLines left/right scroll region" {
+@@ -10135,6 +10164,49 @@ test "Terminal: insertLines left/right scroll region" {
      }
  }
  
@@ -2164,7 +2164,7 @@ index 713e9bcc0..9d4c346df 100644
      const alloc = testing.allocator;
      const io_impl = testing.io;
 diff --git a/src/terminal/render.zig b/src/terminal/render.zig
-index 17a4ca04b..ed8c78332 100644
+index 546ad8a68..358050a1f 100644
 --- a/src/terminal/render.zig
 +++ b/src/terminal/render.zig
 @@ -355,6 +355,25 @@ pub const RenderState = struct {
@@ -2208,7 +2208,7 @@ index 17a4ca04b..ed8c78332 100644
          /// The cell data for the cursor position. Managed memory is not
          /// safe to access from this.
          cell: page.Cell,
-@@ -914,6 +941,56 @@ pub const RenderState = struct {
+@@ -917,6 +944,56 @@ pub const RenderState = struct {
          self.endUpdate();
      }
  
@@ -2265,7 +2265,7 @@ index 17a4ca04b..ed8c78332 100644
      /// Begin an update of the render state to the latest terminal
      /// state. Every begin must be completed with an `endUpdate` call
      /// before the render state is read.
-@@ -1039,6 +1116,7 @@ pub const RenderState = struct {
+@@ -1042,6 +1119,7 @@ pub const RenderState = struct {
          // probably cache this by comparing the cursor pin and viewport pin
          // but may not be worth it.
          self.cursor.viewport = null;
@@ -2273,7 +2273,7 @@ index 17a4ca04b..ed8c78332 100644
  
          // Colors.
          self.colors.cursor = t.colors.cursor.get();
-@@ -1170,15 +1248,25 @@ pub const RenderState = struct {
+@@ -1173,15 +1251,25 @@ pub const RenderState = struct {
              // Find our cursor if we haven't found it yet. We do this even
              // if rows are not dirty because the cursor is unrelated. We
              // can check the chunk bounds once rather than every row.
@@ -2301,7 +2301,7 @@ index 17a4ca04b..ed8c78332 100644
                  const vp_start = self.viewportStart();
                  if (idx < vp_start or idx >= vp_start + self.rows) break :cursor;
                  self.cursor.viewport = .{
-@@ -1187,10 +1275,7 @@ pub const RenderState = struct {
+@@ -1190,10 +1278,7 @@ pub const RenderState = struct {
  
                      // Future: we should use our own state here to look this
                      // up rather than calling this.
@@ -2313,7 +2313,7 @@ index 17a4ca04b..ed8c78332 100644
                  };
              }
  
-@@ -1470,6 +1555,289 @@ pub const RenderState = struct {
+@@ -1479,6 +1564,289 @@ pub const RenderState = struct {
          self.pending_styles.clearRetainingCapacity();
      }
  
@@ -2603,9 +2603,9 @@ index 17a4ca04b..ed8c78332 100644
      /// Mark all render-state data as consumed by the renderer.
      ///
      /// This clears both the global dirty state and every per-row dirty flag.
-@@ -6034,3 +6402,535 @@ test "placements_generation: changes on a region scroll that moves a fixed place
-     try testing.expectEqual(2, (try testOnlyPlacement(&state)).y);
-     try testing.expect(generation != state.imagePlacementsGeneration());
+@@ -6078,3 +6446,535 @@ test "render update retries rows after OOM" {
+     const cells = state.row_data.items(.cells)[0].slice();
+     try testing.expectEqualSlices(u21, &.{0x301}, cells.items(.grapheme)[1]);
  }
 +
 +fn testShiftedUpdate(

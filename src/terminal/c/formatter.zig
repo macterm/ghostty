@@ -115,7 +115,7 @@ pub const Option = enum(c_int) {
     _,
 
     /// The type that a `set` value or a `get` output points to.
-    pub fn Type(comptime self: Option) type {
+    pub fn InType(comptime self: Option) type {
         return switch (self) {
             .invalid => void,
             .emit => Format,
@@ -129,13 +129,14 @@ pub const Option = enum(c_int) {
 
 pub fn terminal_new(
     alloc_: ?*const CAllocator,
-    result: *Formatter,
+    result_: ?*Formatter,
     terminal_: terminal_c.Terminal,
 ) callconv(lib.calling_conv) Result {
     if (comptime !lib.feature(.formatter)) {
-        result.* = null;
+        if (result_) |o| o.* = null;
         return .unsupported;
     }
+    const result = result_ orelse return .invalid_value;
     result.* = terminal_new_(
         alloc_,
         terminal_,
@@ -199,7 +200,7 @@ pub fn set(
 fn setTyped(
     f: *formatterpkg.TerminalFormatter,
     comptime option: Option,
-    value: ?*const option.Type(),
+    value: ?*const option.InType(),
 ) Result {
     switch (option) {
         .invalid => comptime unreachable,
@@ -249,7 +250,7 @@ pub fn get(
 fn getTyped(
     f: *const formatterpkg.TerminalFormatter,
     comptime option: Option,
-    out: *option.Type(),
+    out: *option.InType(),
 ) Result {
     switch (option) {
         .invalid => comptime unreachable,
@@ -304,10 +305,11 @@ pub fn format_buf(
     formatter_: Formatter,
     out_: ?[*]u8,
     out_len: usize,
-    out_written: *usize,
+    out_written_: ?*usize,
 ) callconv(lib.calling_conv) Result {
     if (comptime !lib.feature(.formatter)) return .unsupported;
     const wrapper = formatter_ orelse return .invalid_value;
+    const out_written = out_written_ orelse return .invalid_value;
 
     var writer: std.Io.Writer = .fixed(if (out_) |out|
         out[0..out_len]
@@ -334,11 +336,13 @@ pub fn format_buf(
 pub fn format_alloc(
     formatter_: Formatter,
     alloc_: ?*const CAllocator,
-    out_ptr: *?[*]u8,
-    out_len: *usize,
+    out_ptr_: ?*?[*]u8,
+    out_len_: ?*usize,
 ) callconv(lib.calling_conv) Result {
     if (comptime !lib.feature(.formatter)) return .unsupported;
     const wrapper = formatter_ orelse return .invalid_value;
+    const out_ptr = out_ptr_ orelse return .invalid_value;
+    const out_len = out_len_ orelse return .invalid_value;
     const alloc = lib.alloc.default(alloc_);
 
     var aw: std.Io.Writer.Allocating = .init(alloc);

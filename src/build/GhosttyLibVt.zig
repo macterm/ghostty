@@ -548,7 +548,8 @@ fn initLibApple(
 /// The version metadata of the libghostty-vt shared library. All of it is
 /// derived from `lib_version` here, so every link path agrees.
 /// CMakeLists.txt, nix/libghostty-vt.nix and the CI checks compute the same
-/// values, so update them together with this.
+/// values, so update them together with this. The version string in
+/// nix/libghostty-vt.nix must move with `lib_version`.
 ///
 /// The file names are Zig's usual ones. For version 0.1.0:
 ///
@@ -561,6 +562,9 @@ fn initLibApple(
 /// Except on Windows, the runtime name and the unversioned name
 /// (libghostty-vt.so or libghostty-vt.dylib) are installed as symlinks to
 /// the real file.
+///
+/// The Windows DLL and import library names carry no major version, so
+/// side-by-side installs are not supported on Windows.
 ///
 /// The runtime name only carries the major version. Before 1.0 there is no
 /// ABI promise: any minor release may break the ABI, even though 0.1 and
@@ -648,10 +652,19 @@ fn pkgConfigFiles(
         .description = "Ghostty VT library",
         .description_static = "Ghostty VT library (static)",
         .version = zig.version,
+        // GHOSTTY_STATIC tells the headers that the library is linked
+        // statically. Without it, on Windows every declaration is
+        // __declspec(dllimport) and the link fails.
+        .cflags_static = &.{ "-I${includedir}", "-DGHOSTTY_STATIC" },
         .libs = &.{ "-L${libdir}", "-lghostty-vt" },
         .libs_static = &.{b.fmt("${{libdir}}/{s}", .{staticLibraryName(os_tag)})},
         .libs_private = &.{libsPrivate(zig)},
         .reqs_private = &.{requiresPrivate(b)},
+        // We publish prebuilt Windows zips, and users unzip them
+        // anywhere. On other platforms the library is installed by a
+        // package manager or from source, which expect the absolute
+        // prefix.
+        .relocatable = os_tag == .windows,
     });
 
     return .{
@@ -786,7 +799,7 @@ const CMakeFiles = struct {
         // release may break the ABI, and from 1.0 on only a new major
         // release does. So an install of 0.1.2 satisfies a request for
         // 0.1 or 0.1.1, but not 0.2, and an install of 1.4.2 satisfies
-        // 1.0 or 1.3, but not 2.0.
+        // 1.0 or 1.3.
         //
         // These are the same rules as CMake's
         // write_basic_package_version_file() with COMPATIBILITY
@@ -965,6 +978,60 @@ fn detectAppleSDK(
         },
     ) catch return false;
     return true;
+}
+
+/// Adds the ABI check for this library to two build steps. `test_step` fails
+/// if the library doesn't match the goldens in `src/terminal/c/abi`, and
+/// `update_step` overwrites the goldens for `target` with what the library
+/// has now. See `src/terminal/c/abi/check.zig` for the rules.
+pub fn addAbiCheck(
+    self: *const GhosttyLibVt,
+    b: *std.Build,
+    target: std.Target,
+    test_step: *std.Build.Step,
+    update_step: *std.Build.Step,
+) void {
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/terminal/c/abi/check.zig"),
+        .target = b.graph.host,
+    });
+    const tool = b.addExecutable(.{
+        .name = "lib_vt_abi_check",
+        .root_module = root_module,
+    });
+
+    // Goldens are named after the target, such as x86_64-linux-gnu. Targets
+    // with no ABI leave it out, such as aarch64-macos.
+    const arch_os = b.fmt("{t}-{t}", .{ target.cpu.arch, target.os.tag });
+    const golden = if (target.abi == .none)
+        b.fmt("src/terminal/c/abi/{s}.json", .{arch_os})
+    else
+        b.fmt("src/terminal/c/abi/{s}-{t}.json", .{ arch_os, target.abi });
+
+    inline for (.{
+        .{ "check", test_step },
+        .{ "update", update_step },
+    }) |mode| {
+        const run = b.addRunArtifact(tool);
+        run.addArg(mode[0]);
+        run.addFileArg(self.output);
+        run.addArg(golden);
+        run.addArg("src/terminal/c/abi/symbols.txt");
+        run.addArg("src/lib_vt.zig");
+        run.addArg("include/ghostty");
+        run.setCwd(b.path("."));
+
+        // The source tree paths above are plain arguments, so Zig can't
+        // tell when those files change. Always run, which takes no time.
+        run.has_side_effects = true;
+        mode[1].dependOn(&run.step);
+    }
+
+    const tests = b.addTest(.{
+        .name = "lib-vt-abi-check-test",
+        .root_module = root_module,
+    });
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 }
 
 pub fn install(

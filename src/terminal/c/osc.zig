@@ -20,8 +20,9 @@ pub const Terminator = osc.Terminator.C;
 
 pub fn new(
     alloc_: ?*const CAllocator,
-    result: *Parser,
+    result_: ?*Parser,
 ) callconv(lib.calling_conv) Result {
+    const result = result_ orelse return .invalid_value;
     const alloc = lib.alloc.default(alloc_);
     const ptr = alloc.create(osc.Parser) catch
         return .out_of_memory;
@@ -39,15 +40,18 @@ pub fn free(parser_: Parser) callconv(lib.calling_conv) void {
 }
 
 pub fn reset(parser_: Parser) callconv(lib.calling_conv) void {
-    parser_.?.reset();
+    const parser = parser_ orelse return;
+    parser.reset();
 }
 
 pub fn next(parser_: Parser, byte: u8) callconv(lib.calling_conv) void {
-    parser_.?.next(byte);
+    const parser = parser_ orelse return;
+    parser.next(byte);
 }
 
 pub fn end(parser_: Parser, terminator: u8) callconv(lib.calling_conv) Command {
-    return parser_.?.end(terminator);
+    const parser = parser_ orelse return null;
+    return parser.end(terminator);
 }
 
 /// C: GhosttyOscOption
@@ -55,6 +59,14 @@ pub const Option = enum(c_int) {
     invalid = 0,
     unknown_max_bytes = 1,
     _,
+
+    /// The type that a `set` value points to.
+    pub fn InType(comptime self: Option) type {
+        return switch (self) {
+            .unknown_max_bytes => usize,
+            .invalid, _ => void,
+        };
+    }
 };
 
 pub fn set(
@@ -65,7 +77,7 @@ pub fn set(
     switch (option) {
         .unknown_max_bytes => {
             const parser = parser_ orelse return .invalid_value;
-            const ptr: ?*const usize = @ptrCast(@alignCast(value));
+            const ptr: ?*const Option.unknown_max_bytes.InType() = @ptrCast(@alignCast(value));
             parser.unknown_max_bytes = if (ptr) |v| v.* else 0;
         },
         .invalid => return .invalid_value,

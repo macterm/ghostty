@@ -111,7 +111,6 @@ pub const ClipboardContent = extern struct {
 ///
 /// C: GhosttyClipboardWrite
 pub const ClipboardWrite = extern struct {
-    size: usize,
     location: clipboard.Location,
     contents: ?[*]const ClipboardContent,
     contents_len: usize,
@@ -159,7 +158,6 @@ pub const ClipboardReadReply = extern struct {
 ///
 /// C: GhosttyClipboardRead
 pub const ClipboardRead = extern struct {
-    size: usize,
     location: clipboard.Location,
     mimes: ?[*]const lib.String,
     mimes_len: usize,
@@ -181,7 +179,6 @@ pub const ClipboardReadReplyFn = *const fn (*const ClipboardRead, *const Clipboa
 ///
 /// C: GhosttyTerminalDesktopNotification
 pub const DesktopNotification = extern struct {
-    size: usize,
     title: lib.String,
     body: lib.String,
 };
@@ -193,7 +190,6 @@ pub const ProgressState = osc.Command.ProgressReport.State;
 ///
 /// C: GhosttyTerminalProgressReport
 pub const ProgressReport = extern struct {
-    size: usize,
     state: ProgressState,
     progress: i8,
 };
@@ -219,7 +215,6 @@ pub const ProgramStatusKind = lib.Enum(lib.target, &.{
 ///
 /// C: GhosttyTerminalProgramStatus
 pub const ProgramStatus = extern struct {
-    size: usize,
     state: ProgramStatusState,
     kind: ProgramStatusKind,
     progress: i8,
@@ -239,7 +234,6 @@ pub const SemanticPromptPromptKind = Handler.SemanticPrompt.PromptKind;
 ///
 /// C: GhosttyTerminalSemanticPrompt
 pub const SemanticPrompt = extern struct {
-    size: usize,
     kind: SemanticPromptKind,
     prompt_kind: SemanticPromptPromptKind,
     has_exit_code: bool,
@@ -343,7 +337,7 @@ pub const ModeConfig = extern struct {
 /// - `clipboard_read`: clipboard reads are denied.
 /// - `program_status`: the OSC 7501 support query gets no reply, so
 ///   programs know not to send reports.
-const Effects = struct {
+pub const Effects = struct {
     userdata: ?*anyopaque = null,
     write_pty: ?WritePtyFn = null,
     bell: ?BellFn = null,
@@ -518,7 +512,6 @@ const Effects = struct {
 
         const ctx: ClipboardWriteCtx = .{ .write = write };
         const request: ClipboardWrite = .{
-            .size = @sizeOf(ClipboardWrite),
             .location = write.location,
             .contents = if (contents.len > 0) contents.ptr else null,
             .contents_len = contents.len,
@@ -573,7 +566,6 @@ const Effects = struct {
 
         const ctx: ClipboardReadCtx = .{ .read = read, .wrapper = wrapper };
         const request: ClipboardRead = .{
-            .size = @sizeOf(ClipboardRead),
             .location = read.location,
             .mimes = if (mimes.len > 0) mimes.ptr else null,
             .mimes_len = mimes.len,
@@ -652,7 +644,6 @@ const Effects = struct {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.desktop_notification orelse return;
         const request: DesktopNotification = .{
-            .size = @sizeOf(DesktopNotification),
             .title = .init(notification.title),
             .body = .init(notification.body),
         };
@@ -742,7 +733,6 @@ const Effects = struct {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.progress_report orelse return;
         const c_report: ProgressReport = .{
-            .size = @sizeOf(ProgressReport),
             .state = @fromBackingInt(@backingInt(report.state)),
             .progress = if (report.progress) |value| @intCast(value) else -1,
         };
@@ -766,7 +756,6 @@ const Effects = struct {
         report.writeText(.msg, &message) catch unreachable;
 
         const c_report: ProgramStatus = .{
-            .size = @sizeOf(ProgramStatus),
             .state = report.state,
             .kind = if (report.readOption(.kind)) |kind| switch (kind) {
                 inline else => |tag| @field(ProgramStatusKind, @tagName(tag)),
@@ -787,7 +776,6 @@ const Effects = struct {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.semantic_prompt orelse return;
         const c_event: SemanticPrompt = .{
-            .size = @sizeOf(SemanticPrompt),
             .kind = event.kind,
             .prompt_kind = event.prompt_kind,
             .has_exit_code = event.exit_code != null,
@@ -898,6 +886,10 @@ fn wrap(
         .clipboard_read = null,
         .program_status = null,
     };
+
+    // The C API leaves Glyph Protocol off until the embedder opts in. The
+    // core default stays on for the Ghostty app.
+    handler.apc_handler.enable(.glyph, false);
 
     wrapper.* = .{
         .terminal = t,
@@ -1017,10 +1009,11 @@ const NewError = error{
 
 pub fn new(
     alloc_: ?*const CAllocator,
-    result: *Terminal,
+    result_: ?*Terminal,
     cols: size.CellCountInt,
     rows: size.CellCountInt,
 ) callconv(lib.calling_conv) Result {
+    const result = result_ orelse return .invalid_value;
     result.* = new_(alloc_, cols, rows) catch |err| {
         result.* = null;
         return switch (err) {
@@ -1072,10 +1065,11 @@ fn new_(
 
 pub fn vt_write(
     terminal_: Terminal,
-    ptr: [*]const u8,
+    ptr_: ?[*]const u8,
     len: usize,
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
+    const ptr = ptr_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
 }
 
@@ -1755,8 +1749,7 @@ fn setTyped(
             }
         },
         .glyph_protocol => {
-            // Every APC protocol is enabled by default.
-            const enabled = if (value) |v| v.* else true;
+            const enabled = if (value) |v| v.* else false;
             wrapper.stream.handler.apc_handler.enable(.glyph, enabled);
             if (!enabled) wrapper.terminal.glyph_glossary.clearAndFree(wrapper.terminal.gpa());
         },
@@ -1953,7 +1946,7 @@ pub const TerminalData = enum(c_int) {
     cursor_visible = 7,
     kitty_keyboard_flags = 8,
     scrollbar = 9,
-    cursor_style = 10,
+    cursor_sgr_style = 10,
     mouse_tracking = 11,
     title = 12,
     pwd = 13,
@@ -2006,7 +1999,7 @@ pub const TerminalData = enum(c_int) {
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
-            .cursor_style => style_c.Style,
+            .cursor_sgr_style => style_c.Style,
             .title, .pwd => lib.String,
             .total_rows,
             .scrollback_rows,
@@ -2095,7 +2088,7 @@ fn getTyped(
         .cursor_visible => out.* = t.modes.get(.cursor_visible),
         .kitty_keyboard_flags => out.* = @as(u8, t.screens.active.kitty_keyboard.current().int()),
         .scrollbar => out.* = t.screens.active.pages.scrollbar().cval(),
-        .cursor_style => out.* = .fromStyle(t.screens.active.cursor.style),
+        .cursor_sgr_style => out.* = .fromStyle(t.screens.active.cursor.style),
         .mouse_tracking => out.* = t.modes.get(.mouse_event_x10) or
             t.modes.get(.mouse_event_normal) or
             t.modes.get(.mouse_event_button) or
@@ -2242,12 +2235,14 @@ pub fn grid_ref_track(
 
 pub fn point_from_grid_ref(
     terminal_: Terminal,
-    ref: *const grid_ref_c.CGridRef,
-    tag: point.Tag,
+    ref_: ?*const grid_ref_c.CGridRef,
+    tag_: lib.CEnum(point.Tag),
     out: ?*point.Coordinate,
 ) callconv(lib.calling_conv) Result {
     if (comptime !(lib.feature(.grid_introspection) or lib.feature(.selection))) return .unsupported;
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const ref = ref_ orelse return .invalid_value;
+    const tag = lib.enumFromC(point.Tag, tag_) orelse return .invalid_value;
     const p = ref.toPin() orelse return .invalid_value;
     const pt = t.screens.active.pages.pointFromPin(tag, p) orelse
         return .no_value;
@@ -2712,12 +2707,12 @@ test "set null restores the defaults new starts with" {
     try testing.expectEqual(lines_default, primary.pages.limits.lines.explicit);
 
     const apc_handler = &t.?.stream.handler.apc_handler;
-    try testing.expect(apc_handler.enabled.contains(.glyph));
-    const off = false;
-    try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&off)));
     try testing.expect(!apc_handler.enabled.contains(.glyph));
-    try testing.expectEqual(Result.success, set(t, .glyph_protocol, null));
+    const on = true;
+    try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&on)));
     try testing.expect(apc_handler.enabled.contains(.glyph));
+    try testing.expectEqual(Result.success, set(t, .glyph_protocol, null));
+    try testing.expect(!apc_handler.enabled.contains(.glyph));
 
     // The mode options have no default to restore.
     try testing.expectEqual(Result.invalid_value, set(t, .mode, null));
@@ -4765,7 +4760,7 @@ test "selection derivation helpers" {
     try testing.expectEqual(@as(u16, 4), out.end.toPin().?.x);
     try testing.expectEqual(@as(u16, 1), out.end.toPin().?.y);
 
-    try testing.expectEqual(Result.no_value, selection_c.output(t, line_ref, &out));
+    try testing.expectEqual(Result.no_value, selection_c.output(t, &line_ref, &out));
 
     // The size rule for the three option structs: below the base layout
     // is rejected, a newer caller's zero tail is accepted and a non-zero
@@ -5733,7 +5728,6 @@ test "set desktop_notification callback" {
     const S = struct {
         var count: usize = 0;
         var last_userdata: ?*anyopaque = null;
-        var last_size: usize = 0;
         var title: [64]u8 = undefined;
         var title_len: usize = 0;
         var body: [64]u8 = undefined;
@@ -5746,7 +5740,6 @@ test "set desktop_notification callback" {
         ) callconv(lib.calling_conv) void {
             count += 1;
             last_userdata = ud;
-            last_size = notification.size;
             title_len = notification.title.len;
             body_len = notification.body.len;
             @memcpy(title[0..title_len], notification.title.ptr[0..title_len]);
@@ -5755,7 +5748,6 @@ test "set desktop_notification callback" {
     };
     S.count = 0;
     S.last_userdata = null;
-    S.last_size = 0;
     S.title_len = 0;
     S.body_len = 0;
 
@@ -5775,7 +5767,6 @@ test "set desktop_notification callback" {
     vt_write(t, seq_b, seq_b.len);
     try testing.expectEqual(@as(usize, 1), S.count);
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
-    try testing.expectEqual(@sizeOf(DesktopNotification), S.last_size);
     try testing.expectEqualStrings("Codex", S.title[0..S.title_len]);
     try testing.expectEqualStrings("Needs attention", S.body[0..S.body_len]);
 
@@ -5857,7 +5848,6 @@ test "set progress_report callback" {
     const S = struct {
         var count: usize = 0;
         var last_userdata: ?*anyopaque = null;
-        var last_size: usize = 0;
         var last_state: ProgressState = .remove;
         var last_progress: i8 = -1;
 
@@ -5868,14 +5858,12 @@ test "set progress_report callback" {
         ) callconv(lib.calling_conv) void {
             count += 1;
             last_userdata = ud;
-            last_size = report.size;
             last_state = report.state;
             last_progress = report.progress;
         }
     };
     S.count = 0;
     S.last_userdata = null;
-    S.last_size = 0;
     S.last_state = .remove;
     S.last_progress = -1;
 
@@ -5906,7 +5894,6 @@ test "set progress_report callback" {
         vt_write(t, case.sequence.ptr + midpoint, case.sequence.len - midpoint);
         try testing.expectEqual(expected_count, S.count);
         try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
-        try testing.expectEqual(@sizeOf(ProgressReport), S.last_size);
         try testing.expectEqual(case.state, S.last_state);
         try testing.expectEqual(case.progress, S.last_progress);
     }
@@ -5930,7 +5917,6 @@ test "set program_status callback" {
     const S = struct {
         var count: usize = 0;
         var last_userdata: ?*anyopaque = null;
-        var last_size: usize = 0;
         var last_state: ProgramStatusState = .idle;
         var last_kind: ProgramStatusKind = .none;
         var last_progress: i8 = -1;
@@ -5952,7 +5938,6 @@ test "set program_status callback" {
         ) callconv(lib.calling_conv) void {
             count += 1;
             last_userdata = ud;
-            last_size = report.size;
             last_state = report.state;
             last_kind = report.kind;
             last_progress = report.progress;
@@ -6011,7 +5996,6 @@ test "set program_status callback" {
     vt_write(t, report, report.len);
     try testing.expectEqual(@as(usize, 1), S.count);
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
-    try testing.expectEqual(@sizeOf(ProgramStatus), S.last_size);
     try testing.expectEqual(ProgramStatusState.blocked, S.last_state);
     try testing.expectEqual(ProgramStatusKind.permission, S.last_kind);
     try testing.expectEqual(@as(i8, 40), S.last_progress);
@@ -6054,7 +6038,6 @@ test "set semantic_prompt callback" {
     const S = struct {
         var count: usize = 0;
         var last_userdata: ?*anyopaque = null;
-        var last_size: usize = 0;
         var last_kind: SemanticPromptKind = .invalid;
         var last_prompt_kind: SemanticPromptPromptKind = .primary;
         var last_has_exit_code: bool = false;
@@ -6071,7 +6054,6 @@ test "set semantic_prompt callback" {
         ) callconv(lib.calling_conv) void {
             count += 1;
             last_userdata = ud;
-            last_size = event.size;
             last_kind = event.kind;
             last_prompt_kind = event.prompt_kind;
             last_has_exit_code = event.has_exit_code;
@@ -6084,7 +6066,6 @@ test "set semantic_prompt callback" {
     };
     S.count = 0;
     S.last_userdata = null;
-    S.last_size = 0;
 
     var sentinel: u8 = 100;
     try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
@@ -6098,7 +6079,6 @@ test "set semantic_prompt callback" {
     vt_write(t, prompt, prompt.len);
     try testing.expectEqual(@as(usize, 1), S.count);
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
-    try testing.expectEqual(@sizeOf(SemanticPrompt), S.last_size);
     try testing.expectEqual(SemanticPromptKind.prompt_start, S.last_kind);
     try testing.expectEqual(SemanticPromptPromptKind.right, S.last_prompt_kind);
     try testing.expect(!S.last_has_exit_code);
@@ -6377,7 +6357,6 @@ test "set clipboard_write callback" {
         var count: usize = 0;
         var last_terminal: Terminal = null;
         var last_userdata: ?*anyopaque = null;
-        var last_size: usize = 0;
         var last_location: clipboard.Location = .standard;
         var last_contents_null: bool = false;
         var last_contents_len: usize = 0;
@@ -6398,7 +6377,6 @@ test "set clipboard_write callback" {
             count += 1;
             last_terminal = terminal_;
             last_userdata = ud;
-            last_size = request.size;
             last_location = request.location;
             last_contents_null = request.contents == null;
             last_contents_len = request.contents_len;
@@ -6446,7 +6424,6 @@ test "set clipboard_write callback" {
     try testing.expectEqual(@as(usize, 1), S.count);
     try testing.expectEqual(t, S.last_terminal);
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
-    try testing.expectEqual(@sizeOf(ClipboardWrite), S.last_size);
     try testing.expectEqual(clipboard.Location.standard, S.last_location);
     try testing.expect(!S.last_contents_null);
     try testing.expectEqual(@as(usize, 1), S.last_contents_len);
@@ -6898,7 +6875,6 @@ test "set clipboard_read callback" {
     const S = struct {
         var last_data: ?[]u8 = null;
         var count: usize = 0;
-        var last_size: usize = 0;
         var last_location: clipboard.Location = .standard;
         var last_mimes_len: usize = 0;
         var last_mime_is_text: bool = false;
@@ -6926,7 +6902,6 @@ test "set clipboard_read callback" {
             request: *const ClipboardRead,
         ) callconv(lib.calling_conv) void {
             count += 1;
-            last_size = request.size;
             last_location = request.location;
             last_mimes_len = request.mimes_len;
             last_mime_is_text = request.mimes_len > 0 and std.mem.eql(
@@ -6977,7 +6952,6 @@ test "set clipboard_read callback" {
     const read_bel = "\x1B]52;p;?\x07";
     vt_write(t, read_bel, read_bel.len);
     try testing.expectEqual(1, S.count);
-    try testing.expectEqual(@sizeOf(ClipboardRead), S.last_size);
     try testing.expectEqual(clipboard.Location.primary, S.last_location);
     try testing.expectEqual(1, S.last_mimes_len);
     try testing.expect(S.last_mime_is_text);
@@ -7400,6 +7374,12 @@ test "device_attributes without callback uses default" {
     vt_write(t, "\x1B[c", 3);
     try testing.expect(S.last_data != null);
     try testing.expectEqualStrings("\x1b[?62;22c", S.last_data.?);
+
+    // DA2 and DA3 have defaults too.
+    vt_write(t, "\x1B[>c", 4);
+    try testing.expectEqualStrings("\x1b[>1;0;0c", S.last_data.?);
+    vt_write(t, "\x1B[=c", 4);
+    try testing.expectEqualStrings("\x1bP!|00000000\x1b\\", S.last_data.?);
 }
 
 test "device_attributes callback returns false uses default" {
@@ -8096,7 +8076,13 @@ test "set glyph protocol disables APC handling and clears glossary" {
     ));
     defer free(t);
 
+    // Off by default, so nothing registers until it's enabled.
     const register = "\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\";
+    vt_write(t, register, register.len);
+    try testing.expect(!t.?.terminal.glyph_glossary.contains(0xE0A0));
+
+    const enabled = true;
+    try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&enabled)));
     vt_write(t, register, register.len);
     try testing.expect(t.?.terminal.glyph_glossary.contains(0xE0A0));
 
@@ -8107,11 +8093,6 @@ test "set glyph protocol disables APC handling and clears glossary" {
 
     vt_write(t, register, register.len);
     try testing.expect(!t.?.terminal.glyph_glossary.contains(0xE0A0));
-
-    const enabled = true;
-    try testing.expectEqual(Result.success, set(t, .glyph_protocol, @ptrCast(&enabled)));
-    vt_write(t, register, register.len);
-    try testing.expect(t.?.terminal.glyph_glossary.contains(0xE0A0));
 }
 
 test "get_multi success" {

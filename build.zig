@@ -2,7 +2,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 const buildpkg = @import("src/build/main.zig");
-const translate_c = @import("translate_c");
+
+const c_deps = @import("src/build/c_deps.zig");
 
 /// App version from build.zig.zon.
 const app_zon_version = @import("build.zig.zon").version;
@@ -12,7 +13,7 @@ const app_zon_version = @import("build.zig.zon").version;
 ///
 /// CMakeLists.txt and CI read this line with a regular expression, so
 /// keep it on one line in this form.
-const lib_version = "0.1.0-dev";
+const lib_version = "1.1.0-dev";
 
 /// Minimum required zig version.
 const minimum_zig_version = @import("build.zig.zon").minimum_zig_version;
@@ -71,6 +72,14 @@ pub fn build(b: *std.Build) !void {
         "test-lib-vt-schema",
         "Validate the libghostty-vt ABI type manifest",
     );
+    const test_lib_vt_abi_step = b.step(
+        "test-lib-vt-abi",
+        "Fail if libghostty-vt changed its ABI in a way that is not an addition",
+    );
+    const update_lib_vt_abi_step = b.step(
+        "update-lib-vt-abi",
+        "Record the libghostty-vt ABI of the current target in src/terminal/c/abi",
+    );
     const test_valgrind_step = b.step(
         "test-valgrind",
         "Run tests under valgrind",
@@ -81,7 +90,13 @@ pub fn build(b: *std.Build) !void {
     );
 
     // Ghostty resources like terminfo, shell integration, themes, etc.
-    const resources = try buildpkg.GhosttyResources.init(b, &config, &deps);
+    // Only the app uses them, so a libghostty-vt build skips them, which
+    // also keeps it from downloading the themes package. This is null only
+    // when emit_lib_vt is set, and every use below is in an app-only branch.
+    const resources: ?buildpkg.GhosttyResources = if (config.emit_lib_vt)
+        null
+    else
+        try buildpkg.GhosttyResources.init(b, &config, &deps);
     const i18n = if (config.i18n) try buildpkg.GhosttyI18n.init(b, &config) else null;
 
     // Ghostty executable, the actual runnable Ghostty program.
@@ -119,6 +134,14 @@ pub fn build(b: *std.Build) !void {
         const check_step = b.step("distcheck", "Install and validate the dist tarball");
         check_step.dependOn(dist.check_step);
         check_step.dependOn(dist.install_step);
+        // Only libghostty-vt builds (-Demit-lib-vt) have this step.
+        if (dist.deps_install_step) |deps_install| {
+            const deps_step = b.step(
+                "dist-deps",
+                "Build the libghostty-vt dependency tarball for offline builds (needs network)",
+            );
+            deps_step.dependOn(deps_install);
+        }
     }
 
     // libghostty-vt
@@ -154,6 +177,8 @@ pub fn build(b: *std.Build) !void {
         type_schema_test.addFileArg(b.path("src/terminal/c/types.schema.json"));
         type_schema_test.addFileArg(shared.output);
         test_lib_vt_schema_step.dependOn(&type_schema_test.step);
+
+        shared.addAbiCheck(b, config.target.result, test_lib_vt_abi_step, update_lib_vt_abi_step);
     } else {
         _ = b.addFail("cannot execute the ABI manifest for a native freestanding target");
     }
@@ -220,7 +245,7 @@ pub fn build(b: *std.Build) !void {
     if (config.app_runtime != .none) {
         if (config.emit_exe) {
             exe.install();
-            resources.install();
+            if (resources) |v| v.install();
             if (i18n) |v| v.install();
         }
     } else if (!config.emit_lib_vt) {
@@ -263,7 +288,7 @@ pub fn build(b: *std.Build) !void {
 
             // The xcframework build always installs resources because our
             // macOS xcode project contains references to them.
-            resources.install();
+            resources.?.install();
             if (i18n) |v| v.install();
         }
 
@@ -275,7 +300,7 @@ pub fn build(b: *std.Build) !void {
                 .xcframework = &xcframework,
                 .docs = &docs,
                 .i18n = if (i18n) |v| &v else null,
-                .resources = &resources,
+                .resources = &resources.?,
             },
         );
         if (config.emit_macos_app) {
@@ -323,7 +348,7 @@ pub fn build(b: *std.Build) !void {
                     .xcframework = &xcframework_native,
                     .docs = &docs,
                     .i18n = if (i18n) |v| &v else null,
-                    .resources = &resources,
+                    .resources = &resources.?,
                 },
             );
 
@@ -370,6 +395,7 @@ pub fn build(b: *std.Build) !void {
             .root_module = mod.vt,
             .filters = test_filters,
         });
+        try c_deps.add(b, .@"ghostty-vt-h", mod_vt_test.root_module, &config, .{});
         const mod_vt_test_run = b.addRunArtifact(mod_vt_test);
         test_lib_vt_step.dependOn(&mod_vt_test_run.step);
 
@@ -381,18 +407,28 @@ pub fn build(b: *std.Build) !void {
         const mod_vt_c_test_run = b.addRunArtifact(mod_vt_c_test);
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
 
-        // The committed version.h must match lib_version, so a version
-        // bump has to update both. The test embeds the header, so both
-        // files are copied into one directory.
-        const version_h_test = version_h_test: {
+        // The committed version.h, the symbol version nodes in
+        // ghostty-vt.map and the version in the nix package must all match
+        // lib_version, so a version bump has to update them together. The
+        // test embeds these files, so they are all copied into one
+        // directory.
+        const version_test = version_test: {
             const wf = b.addWriteFiles();
             const root = wf.addCopyFile(
-                b.path("src/terminal/c/version_h_test.zig"),
-                "version_h_test.zig",
+                b.path("src/terminal/c/version_test.zig"),
+                "version_test.zig",
             );
             _ = wf.addCopyFile(
                 b.path("include/ghostty/vt/version.h"),
                 "version.h",
+            );
+            _ = wf.addCopyFile(
+                b.path("src/terminal/c/ghostty-vt.map"),
+                "ghostty-vt.map",
+            );
+            _ = wf.addCopyFile(
+                b.path("nix/libghostty-vt.nix"),
+                "libghostty-vt.nix",
             );
             const opts = b.addOptions();
             opts.addOption(std.SemanticVersion, "lib_version", config.lib_version);
@@ -402,13 +438,13 @@ pub fn build(b: *std.Build) !void {
                 .optimize = .debug,
             });
             test_mod.addOptions("lib_version", opts);
-            break :version_h_test b.addTest(.{
-                .name = "ghostty-vt-version-h-test",
+            break :version_test b.addTest(.{
+                .name = "ghostty-vt-version-test",
                 .root_module = test_mod,
                 .filters = test_filters,
             });
         };
-        test_lib_vt_step.dependOn(&b.addRunArtifact(version_h_test).step);
+        test_lib_vt_step.dependOn(&b.addRunArtifact(version_test).step);
 
         // The public headers must compile without warnings in every
         // language standard we support, so compile a file that includes
@@ -488,7 +524,14 @@ pub fn build(b: *std.Build) !void {
         }
         _ = try deps.add(test_exe);
 
-        addGhosttyH(b, test_exe.root_module, config.baselineTarget(b.graph.io), .debug);
+        try c_deps.add(b, .@"ghostty-h", test_exe.root_module, &config, .{
+            .target = config.baselineTarget(b.graph.io),
+            .optimize = .Debug,
+        });
+        try c_deps.add(b, .@"ghostty-vt-h", test_exe.root_module, &config, .{
+            .target = config.baselineTarget(b.graph.io),
+            .optimize = .Debug,
+        });
 
         // Normal test running
         const test_run = b.addRunArtifact(test_exe);
@@ -519,22 +562,6 @@ pub fn build(b: *std.Build) !void {
     } else {
         _ = b.addFail("cannot update translations when i18n is disabled");
     }
-}
-
-fn addGhosttyH(
-    b: *std.Build,
-    module: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.lang.Optimize,
-) void {
-    translate_c.addImportToModule(b, "ghostty.h", module, .{
-        .source = .{ .includes = .{ .files = &.{
-            .{ .path = "ghostty.h" },
-        } } },
-        .target = target,
-        .optimize = optimize,
-        .system_include_paths = &.{b.path("include")},
-    }) catch unreachable;
 }
 
 /// Returns the trimmed contents of `name` in the build root, or null if

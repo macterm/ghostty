@@ -19,32 +19,31 @@
 extern "C" {
 #endif
 
-/** @defgroup selection Selection
+/** @addtogroup selection
  *
- * A snapshot selection range defined by two grid references that identifies
- * a contiguous or rectangular region of terminal content.
+ * A selection is a range of terminal content between two cells. It is a
+ * snapshot, only valid until the next change to the terminal.
  *
- * The start and end values are GhosttyGridRef values. They are therefore
- * untracked grid references and inherit the same lifetime rules: they are
- * only safe to use until the next mutating operation on the terminal that
- * produced them, including freeing the terminal. To keep a selection valid
- * across terminal mutations, callers must maintain tracked grid references
- * for the endpoints and reconstruct a GhosttySelection from fresh snapshots
- * when needed.
+ * You need a terminal, and usually a grid reference to start from.
  *
- * Selection gestures provide a reusable state machine for turning UI pointer
- * interactions into selection snapshots. A caller creates one
- * GhosttySelectionGesture per active gesture stream, reuses typed
- * GhosttySelectionGestureEvent objects for synthetic press, drag, release,
- * autoscroll tick, and deep-press events, and applies each event with
- * ghostty_selection_gesture_event(). The returned GhosttySelection is a
- * snapshot; the embedder decides whether to render it, format/copy it, or
- * install it as the terminal's active selection.
+ * ## Example
  *
- * ## Examples
+ * @code{.c}
+ * GhosttyTerminalSelectWordOptions word =
+ *     GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
+ * word.ref = ref;
  *
- * @snippet c-vt-selection/src/main.c selection-main
- * @snippet c-vt-selection-gesture/src/main.c selection-gesture-main
+ * GhosttySelection selection = {0};
+ * if (ghostty_terminal_select_word(terminal, &word, &selection) ==
+ *     GHOSTTY_SUCCESS) {
+ *   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
+ * }
+ * @endcode
+ *
+ * Full program: @ref c-vt-selection/src/main.c
+ *
+ * The @ref guide-selection "Selection guide" covers making one, turning pointer
+ * gestures into one, and copying it out.
  *
  * @{
  */
@@ -157,7 +156,7 @@ typedef struct {
  * Options for deriving a word selection from a terminal grid reference.
  *
  * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED(), then set
- * the fields you need. See @ref sized_sec.
+ * the fields you need. See @ref sized-structs.
  *
  * If boundary_codepoints is NULL and boundary_codepoints_len is 0, Ghostty's
  * default word-boundary codepoints are used. If boundary_codepoints_len is
@@ -183,7 +182,7 @@ typedef struct {
  * Options for deriving the nearest word selection between two grid references.
  *
  * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED(), then set
- * the fields you need. See @ref sized_sec.
+ * the fields you need. See @ref sized-structs.
  *
  * If boundary_codepoints is NULL and boundary_codepoints_len is 0, Ghostty's
  * default word-boundary codepoints are used. If boundary_codepoints_len is
@@ -212,7 +211,7 @@ typedef struct {
  * Options for deriving a line selection from a terminal grid reference.
  *
  * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED(), then set
- * the fields you need. See @ref sized_sec.
+ * the fields you need. See @ref sized-structs.
  *
  * If whitespace is NULL and whitespace_len is 0, Ghostty's default line-trim
  * whitespace codepoints are used. If whitespace_len is non-zero, whitespace
@@ -236,51 +235,6 @@ typedef struct {
   /** Whether semantic prompt state changes should bound the line selection. */
   bool semantic_prompt_boundary;
 } GhosttyTerminalSelectLineOptions;
-
-/**
- * Options for one-shot formatting of a terminal selection.
- *
- * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED(), then set
- * the fields you need. See @ref sized_sec.
- *
- * If selection is NULL, the terminal's current active selection is used.
- * If selection is non-NULL, that caller-provided snapshot selection is used.
- *
- * The selection is formatted from the terminal's active screen using the same
- * formatting semantics as GhosttyFormatter. For copy/clipboard behavior
- * matching Ghostty's Screen.selectionString(), use plain output with unwrap
- * and trim both set to true.
- *
- * @ingroup selection
- */
-typedef struct {
-  /** Size of this struct in bytes. Must be set to sizeof(GhosttyTerminalSelectionFormatOptions). */
-  size_t size;
-
-  /** Output format to emit. */
-  GhosttyFormatterFormat emit;
-
-  /** Whether to unwrap soft-wrapped lines. */
-  bool unwrap;
-
-  /**
-   * Whether to trim trailing whitespace on non-blank lines. Trailing blank
-   * lines are always trimmed, except in VT output without trimming, where
-   * they are kept as part of the layout.
-   */
-  bool trim;
-
-  /**
-   * Optional selection to format.
-   *
-   * If NULL, the terminal's current active selection is used. If the terminal
-   * has no active selection, formatting returns GHOSTTY_NO_VALUE.
-   *
-   * If non-NULL, the pointed-to selection must be a valid snapshot selection
-   * for this terminal and must obey GhosttySelection lifetime rules.
-   */
-  const GhosttySelection *selection;
-} GhosttyTerminalSelectionFormatOptions;
 
 /**
  * Ordering of a selection's endpoints in terminal coordinates.
@@ -575,6 +529,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_SELECTION_GESTURE_EVENT_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttySelectionGestureEventOption;
 
+/** @name Gesture Events
+ * @{
+ */
+
 /**
  * Create a reusable selection gesture event object.
  *
@@ -650,6 +608,15 @@ GHOSTTY_API GhosttyResult ghostty_selection_gesture_event_set(
  * rectangle, and word-boundary codepoints are optional and use initialized
  * defaults when unset or cleared.
  *
+ * An autoscroll tick scrolls the viewport exactly one row in the direction
+ * GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL reports, then continues the drag at
+ * the viewport coordinate. The gesture has no timer of its own. While that
+ * direction is up or down, send ticks from a timer you run. The interval is up
+ * to you, and ticking faster scrolls faster. A tick returns GHOSTTY_NO_VALUE
+ * and scrolls nothing if there's no direction to scroll in. If the cell of the
+ * original press is no longer on the active screen, it also resets the gesture
+ * and leaves any existing terminal selection alone, so stop your timer.
+ *
  * For GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DEEP_PRESS, only
  * GHOSTTY_SELECTION_GESTURE_EVENT_OPT_WORD_BOUNDARY_CODEPOINTS is valid. It is
  * optional and uses initialized defaults when unset or cleared.
@@ -674,6 +641,12 @@ GHOSTTY_API GhosttyResult ghostty_selection_gesture_event(
                                     GhosttyTerminal terminal,
                                     GhosttySelectionGestureEvent event,
                                     GhosttySelection* out_selection);
+
+/** @} */
+
+/** @name Gestures
+ * @{
+ */
 
 /**
  * Create a selection gesture object.
@@ -761,8 +734,13 @@ GHOSTTY_API GhosttyResult ghostty_selection_gesture_get(
 /**
  * Read multiple data fields from a selection gesture in a single call.
  *
- * This is an optimization over calling ghostty_selection_gesture_get() multiple
- * times. Each entry in values must point to storage of the type documented by
+ * Use this when each call into the library is expensive, for example from
+ * WebAssembly or from another language through its foreign function
+ * interface. It reads every key in one call. From C in the same process it
+ * costs the same as calling ghostty_selection_gesture_get() once per key, so
+ * use whichever reads better.
+ *
+ * Each entry in values must point to storage of the type documented by
  * the corresponding GhosttySelectionGestureData key.
  *
  * If any individual read fails, the function returns that error and writes the
@@ -772,8 +750,8 @@ GHOSTTY_API GhosttyResult ghostty_selection_gesture_get(
  * @param gesture Selection gesture handle (NULL returns GHOSTTY_INVALID_VALUE)
  * @param terminal Terminal used to validate terminal-backed gesture state
  * @param count Number of data fields to read
- * @param keys Data fields to read (must not be NULL)
- * @param values Output pointers corresponding to keys (must not be NULL)
+ * @param keys Data fields to read (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param values Output pointers corresponding to keys (NULL returns GHOSTTY_INVALID_VALUE)
  * @param out_written Optional number of fields read, or failing index on error
  * @return GHOSTTY_SUCCESS if every key succeeds. Otherwise the result of the
  *         first key that failed, for example GHOSTTY_UNSUPPORTED for a key
@@ -788,6 +766,12 @@ GHOSTTY_API GhosttyResult ghostty_selection_gesture_get_multi(
                                     const GhosttySelectionGestureData* keys,
                                     void** values,
                                     size_t* out_written);
+
+/** @} */
+
+/** @name Selecting
+ * @{
+ */
 
 /**
  * Derive a word selection snapshot from a terminal grid reference.
@@ -825,6 +809,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_select_word(
  * reverse direction, and combine the two word bounds into the drag selection.
  *
  * @snippet c-vt-selection/src/main.c selection-word-between
+ *
+ * Full program: @ref c-vt-selection/src/main.c
  *
  * The returned selection is not installed as the terminal's current
  * selection. It is a snapshot with the same lifetime rules as GhosttySelection.
@@ -889,8 +875,19 @@ GHOSTTY_API GhosttyResult ghostty_terminal_select_all(
  * The returned selection is not installed as the terminal's current
  * selection. It is a snapshot with the same lifetime rules as GhosttySelection.
  *
+ * @code{.c}
+ * GhosttyGridRef ref = {0};
+ * ghostty_terminal_grid_ref(terminal, point, &ref);
+ *
+ * GhosttySelection selection = {0};
+ * if (ghostty_terminal_select_output(terminal, &ref, &selection) == GHOSTTY_SUCCESS) {
+ *   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
+ * }
+ * @endcode
+ *
  * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
- * @param ref Grid reference within command output to select
+ * @param ref Grid reference within command output to select (NULL returns
+ *            GHOSTTY_INVALID_VALUE)
  * @param[out] out_selection On success, receives the derived selection
  * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if the valid ref is
  *         not selectable command output, or GHOSTTY_INVALID_VALUE if the
@@ -900,92 +897,19 @@ GHOSTTY_API GhosttyResult ghostty_terminal_select_all(
  */
 GHOSTTY_API GhosttyResult ghostty_terminal_select_output(
                                     GhosttyTerminal terminal,
-                                    GhosttyGridRef ref,
+                                    const GhosttyGridRef* ref,
                                     GhosttySelection* out_selection);
 
-/**
- * Format a terminal selection into a caller-provided buffer.
- *
- * This is a one-shot convenience API for formatting either the terminal's
- * active selection or a caller-provided GhosttySelection without explicitly
- * creating a GhosttyFormatter.
- *
- * Pass NULL for buf to query the required output size. In that case,
- * out_written receives the required size and the function returns
- * GHOSTTY_OUT_OF_SPACE.
- *
- * If buf is too small, the function returns GHOSTTY_OUT_OF_SPACE and writes
- * the required size to out_written. The caller can then retry with a larger
- * buffer.
- *
- * Pass NULL for options to use the defaults: plain text, no unwrapping or
- * trimming, and the terminal's active selection. This is the same as
- * passing options initialized with GHOSTTY_INIT_SIZED().
- *
- * If no selection is given and the terminal has no active selection, the
- * function returns GHOSTTY_NO_VALUE.
- *
- * @param terminal The terminal to read from (must not be NULL)
- * @param options Selection formatting options, or NULL for the defaults
- * @param buf Output buffer, or NULL to query required size
- * @param buf_len Length of buf in bytes
- * @param out_written Number of bytes written, or required size on
- *                    GHOSTTY_OUT_OF_SPACE (must not be NULL)
- * @return GHOSTTY_SUCCESS on success, or an error code on failure
- *
- * @ingroup selection
- */
-GHOSTTY_API GhosttyResult ghostty_terminal_selection_format_buf(
-                                    GhosttyTerminal terminal,
-                                    const GhosttyTerminalSelectionFormatOptions* options,
-                                    uint8_t* buf,
-                                    size_t buf_len,
-                                    size_t* out_written);
+/** @} */
 
-/**
- * Format a terminal selection into an allocated buffer.
- *
- * This is a one-shot convenience API for formatting either the terminal's
- * active selection or a caller-provided GhosttySelection without explicitly
- * creating a GhosttyFormatter.
- *
- * The returned buffer is allocated using allocator, or the default allocator
- * if NULL is passed. The caller owns the returned buffer and must free it with
- * ghostty_free(), passing the same allocator and returned length.
- * Empty output returns GHOSTTY_SUCCESS with *out_ptr set to NULL and
- * *out_len set to zero. This result can be passed to ghostty_free().
- *
- * The returned bytes are not NUL-terminated. This supports plain text, VT, and
- * HTML uniformly as byte output.
- *
- * Pass NULL for options to use the defaults: plain text, no unwrapping or
- * trimming, and the terminal's active selection. This is the same as
- * passing options initialized with GHOSTTY_INIT_SIZED().
- *
- * If no selection is given and the terminal has no active selection, the
- * function returns GHOSTTY_NO_VALUE and leaves out_ptr as NULL and out_len
- * as 0.
- *
- * @param terminal The terminal to read from (must not be NULL)
- * @param allocator Allocator used for the returned buffer, or NULL for the default allocator
- * @param options Selection formatting options, or NULL for the defaults
- * @param out_ptr Receives the allocated output buffer (must not be NULL)
- * @param out_len Receives the output length in bytes (must not be NULL)
- * @return GHOSTTY_SUCCESS on success, or an error code on failure
- *
- * @ingroup selection
+/** @name Working with Selections
+ * @{
  */
-GHOSTTY_API GhosttyResult ghostty_terminal_selection_format_alloc(
-                                    GhosttyTerminal terminal,
-                                    const GhosttyAllocator* allocator,
-                                    const GhosttyTerminalSelectionFormatOptions* options,
-                                    uint8_t** out_ptr,
-                                    size_t* out_len);
 
 /**
  * Adjust a selection snapshot using terminal selection semantics.
  *
- * This mutates the caller-provided GhosttySelection in place. The logical end
+ * This mutates your GhosttySelection in place. The logical end
  * endpoint is always moved, regardless of whether the selection is forward or
  * reversed visually. The input selection remains a snapshot: after adjustment,
  * call ghostty_terminal_set() with GHOSTTY_TERMINAL_OPT_SELECTION to install it
@@ -1126,6 +1050,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_selection_equal(
                                     const GhosttySelection* a,
                                     const GhosttySelection* b,
                                     bool* out_equal);
+
+/** @} */
 
 /** @} */
 

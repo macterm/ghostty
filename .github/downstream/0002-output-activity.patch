@@ -22,26 +22,26 @@ ghostty_action_tag_e so existing tag values remain unchanged.
 ---
  include/ghostty.h                       |  2 +
  macos/Sources/Ghostty/Ghostty.App.swift |  4 ++
- src/Surface.zig                         | 18 +++++++
- src/apprt/action.zig                    | 11 ++++
+ src/Surface.zig                         | 18 +++++++++
+ src/apprt/action.zig                    | 10 +++++
  src/apprt/gtk/class/application.zig     |  3 ++
- src/apprt/surface.zig                   |  9 ++++
- src/termio/Termio.zig                   | 68 +++++++++++++++++++++++++
- 7 files changed, 115 insertions(+)
+ src/apprt/surface.zig                   |  9 +++++
+ src/termio/Termio.zig                   | 68 +++++++++++++++++++++++++++++++++
+ 7 files changed, 114 insertions(+)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
-index fe6224b59..5fc3920c0 100644
+index e29090264..3bae55762 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
-@@ -1019,6 +1019,7 @@ typedef enum {
-   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+@@ -1044,6 +1044,7 @@ typedef enum {
    GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
    GHOSTTY_ACTION_RESIZE_WINDOW,
+   GHOSTTY_ACTION_SET_WINDOW_THEME,
 +  GHOSTTY_ACTION_OUTPUT_ACTIVITY,
  } ghostty_action_tag_e;
  
  typedef union {
-@@ -1034,6 +1035,7 @@ typedef union {
+@@ -1059,6 +1060,7 @@ typedef union {
    ghostty_action_resize_window_s resize_window;
    ghostty_action_cell_size_s cell_size;
    ghostty_action_scrollbar_s scrollbar;
@@ -50,10 +50,10 @@ index fe6224b59..5fc3920c0 100644
    ghostty_action_export_terminal_io_s export_terminal_io;
    ghostty_action_desktop_notification_s desktop_notification;
 diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
-index 838b2b8da..fee323d15 100644
+index 0cf2c1f35..69f0685a0 100644
 --- a/macos/Sources/Ghostty/Ghostty.App.swift
 +++ b/macos/Sources/Ghostty/Ghostty.App.swift
-@@ -756,6 +756,10 @@ extension Ghostty {
+@@ -744,6 +744,10 @@ extension Ghostty {
              case GHOSTTY_ACTION_SCROLLBAR:
                  scrollbar(app, target: target, v: action.action.scrollbar)
  
@@ -65,10 +65,10 @@ index 838b2b8da..fee323d15 100644
                  closeAllWindows(app, target: target)
  
 diff --git a/src/Surface.zig b/src/Surface.zig
-index 44b79db37..977227c9e 100644
+index 98ad00f30..6c4727063 100644
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
-@@ -1124,6 +1124,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
+@@ -1158,6 +1158,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
  
          .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
  
@@ -77,7 +77,7 @@ index 44b79db37..977227c9e 100644
          .present_surface => try self.presentSurface(),
  
          .password_input => |v| try self.passwordInput(v),
-@@ -1753,6 +1755,22 @@ fn redraw(self: *Surface) void {
+@@ -1787,6 +1789,22 @@ fn redraw(self: *Surface) void {
      };
  }
  
@@ -101,13 +101,13 @@ index 44b79db37..977227c9e 100644
  /// so that the apprt can reload the configuration.
  fn notifyConfigConditionalState(self: *Surface) void {
 diff --git a/src/apprt/action.zig b/src/apprt/action.zig
-index 54a8faf19..830c6be0a 100644
+index 0cacc0492..b45bed11a 100644
 --- a/src/apprt/action.zig
 +++ b/src/apprt/action.zig
-@@ -364,6 +364,16 @@ pub const Action = union(Key) {
-     /// split or the window is fullscreen.
-     resize_window: ResizeWindow,
+@@ -366,6 +366,15 @@ pub const Action = union(Key) {
  
+     /// Set the application window theme for this session.
+     set_window_theme: WindowTheme,
 +    /// A throttled heartbeat emitted from the IO path whenever the
 +    /// child/pty produces output. Unlike `scrollbar` (a renderer-track
 +    /// action that stops while the surface is occluded), this is delivered
@@ -117,23 +117,22 @@ index 54a8faf19..830c6be0a 100644
 +    /// or run in background tabs. The payload is the current scrollbar
 +    /// geometry, matching `scrollbar`.
 +    output_activity: terminal.Scrollbar,
-+
+ 
      /// Sync with: ghostty_action_tag_e
      pub const Key = enum(c_int) {
-         quit,
-@@ -436,6 +446,7 @@ pub const Action = union(Key) {
-         copy_title_to_clipboard,
+@@ -440,6 +449,7 @@ pub const Action = union(Key) {
          move_tab_to_new_window,
          resize_window,
+         set_window_theme,
 +        output_activity,
  
          test "ghostty.h Action.Key" {
              try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
 diff --git a/src/apprt/gtk/class/application.zig b/src/apprt/gtk/class/application.zig
-index 80cc8bddc..631280080 100644
+index 18786bad1..902f790d9 100644
 --- a/src/apprt/gtk/class/application.zig
 +++ b/src/apprt/gtk/class/application.zig
-@@ -775,6 +775,9 @@ pub const Application = extern struct {
+@@ -780,6 +780,9 @@ pub const Application = extern struct {
              // GTK has no accessibility consumer for this yet.
              .selection_changed => {},
  
@@ -164,7 +163,7 @@ index 3b1a04d8a..16547e579 100644
      search_total: ?usize,
  
 diff --git a/src/termio/Termio.zig b/src/termio/Termio.zig
-index d08f2e5ff..8abe243e8 100644
+index 49bd6e0cd..77b7d663c 100644
 --- a/src/termio/Termio.zig
 +++ b/src/termio/Termio.zig
 @@ -69,6 +69,12 @@ terminal_stream: StreamHandler.Stream,
@@ -180,7 +179,7 @@ index d08f2e5ff..8abe243e8 100644
  /// State we have for thread enter. This may be null if we don't need
  /// to keep track of any state or if its already been freed.
  thread_enter_state: ?*ThreadEnterState = null,
-@@ -723,6 +729,37 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
+@@ -753,6 +759,37 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
          self.terminal_stream.nextSlice(buf);
      }
  
@@ -218,7 +217,7 @@ index d08f2e5ff..8abe243e8 100644
      // If our stream handling caused messages to be sent to the mailbox
      // thread, then we need to wake it up so that it processes them.
      if (self.terminal_stream.handler.termio_messaged) {
-@@ -731,6 +768,37 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
+@@ -761,6 +798,37 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
      }
  }
  

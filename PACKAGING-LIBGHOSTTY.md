@@ -1,10 +1,8 @@
 # Packaging libghostty-vt for Distribution
 
-libghostty-vt is a C library for parsing terminal escape sequences and
-maintaining terminal state, such as the screen, scrollback, styles and
-cursor. It is extracted from Ghostty and needs nothing at runtime beyond
-the C library. This document provides guidance to package maintainers on
-how to package libghostty-vt for distribution.
+libghostty-vt is a portable, high-performance C library for terminal emulation.
+This document provides guidance to package maintainers on how to package
+libghostty-vt for distribution.
 
 libghostty-vt is released separately from Ghostty, with its own version
 numbers and its own `vt-X.Y.Z` tags. The version of the Ghostty app doesn't
@@ -23,12 +21,26 @@ repository instead.
 
 Source tarballs with stable checksums are available for tagged releases
 at `release.files.ghostty.org` in the following URL format where
-`VERSION` is the version number with no prefix such as `0.1.0`:
+`VERSION` is the version number with no prefix such as `1.0.0`:
 
 ```
 https://release.files.ghostty.org/libghostty-vt/VERSION/libghostty-vt-VERSION.tar.gz
 https://release.files.ghostty.org/libghostty-vt/VERSION/libghostty-vt-VERSION.tar.gz.minisig
 ```
+
+The build needs a few Zig packages that aren't in the source tarball.
+Rather than have Zig download them during the build, you can download a
+dependency tarball that contains all of them, published next to each
+source tarball:
+
+```
+https://release.files.ghostty.org/libghostty-vt/VERSION/libghostty-vt-VERSION-deps.tar.gz
+https://release.files.ghostty.org/libghostty-vt/VERSION/libghostty-vt-VERSION-deps.tar.gz.minisig
+```
+
+The source tarball and the dependency tarball of one version belong
+together. Don't mix tarballs from different versions. See
+[Building libghostty-vt](#building-libghostty-vt) for how to use them.
 
 This is the only place releases are published. The same directory also
 holds prebuilt files for app developers:
@@ -37,10 +49,15 @@ holds prebuilt files for app developers:
 - `ghostty-vt-VERSION.wasm` and `ghostty-vt-VERSION-small.wasm`: the
   WebAssembly module, built with `ReleaseFast` and `ReleaseSmall`. See
   [WebAssembly](#webassembly).
-- `libghostty-vt-VERSION-docs.zip`: the C API reference as HTML.
+- `ghostty-vt-VERSION-x86_64-windows-gnu.zip` and
+  `ghostty-vt-VERSION-aarch64-windows-gnu.zip`: the Windows install tree
+  described in [Installed Files](#installed-files), built with
+  `ReleaseFast`.
+- `libghostty-vt-VERSION-docs.zip`: the C API reference as HTML. The HTML
+  reference for each release is also at <https://lib.ghostty.org/vt/X.Y.Z/>.
 
 Every file has a `.minisig` signature next to it. `SHA256SUMS` lists the
-checksums of the tarball and the files above, and is signed too, as
+checksums of both tarballs and the files above, and is signed too, as
 `SHA256SUMS.minisig`.
 Signature files are signed with
 [minisign](https://jedisct1.github.io/minisign/)
@@ -55,10 +72,11 @@ For example, to check a downloaded tarball:
 
 ```sh
 minisign -V -P RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV \
-  -m libghostty-vt-0.1.0.tar.gz
+  -m libghostty-vt-1.0.0.tar.gz
 ```
 
-The tarball unpacks to a `libghostty-vt-VERSION` directory.
+The source tarball unpacks to a `libghostty-vt-VERSION` directory, and the
+dependency tarball to a `libghostty-vt-VERSION-deps` directory.
 
 **Tip source tarballs** are available on the
 [GitHub releases page](https://github.com/ghostty-org/ghostty/releases/tag/tip).
@@ -91,32 +109,34 @@ The build checks the Zig version and stops with an error if it doesn't
 match. The major and minor versions must match exactly, and any patch
 version at least as new is accepted.
 
-For example, libghostty-vt 0.1.0 requires Zig 0.17.0. Any Zig 0.17.x
+For example, libghostty-vt 1.0.0 requires Zig 0.17.0. Any Zig 0.17.x
 works, but Zig 0.16 and Zig 0.18 do not.
 
 ## Building libghostty-vt
 
 The following is a standard example of how to build libghostty-vt _for
-system packages_. Run these commands from the unpacked source tarball.
+system packages_. The build needs no internet access: Zig finds every
+package it needs in the directory passed with `--system`.
 
-1. First, we fetch our dependencies from the internet into a cached
-   directory. This is the only step that requires internet access.
-   `deps/libghostty-vt.txt` lists only the packages the library needs, so
-   this downloads far less than a Ghostty app build would:
+1. First, download the source tarball and the dependency tarball of the
+   same version, check both signatures as shown in
+   [Source Tarballs](#source-tarballs), and unpack them side by side:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/tmp/offline-cache \
-  ./nix/build-support/fetch-zig-cache.sh deps/libghostty-vt.txt
+tar -xzf libghostty-vt-1.0.0.tar.gz
+tar -xzf libghostty-vt-1.0.0-deps.tar.gz
+cd libghostty-vt-1.0.0
 ```
 
-2. Next, we build libghostty-vt. This step requires no internet access:
+1. Next, build libghostty-vt from the unpacked source tarball, with the
+   unpacked dependency tarball as the `--system` directory:
 
 ```sh
 DESTDIR=/tmp/pkg \
 ZIG_GLOBAL_CACHE_DIR=/tmp/build-cache \
 zig build \
   --prefix /usr \
-  --system /tmp/offline-cache/p \
+  --system ../libghostty-vt-1.0.0-deps \
   -Doptimize=ReleaseFast \
   -Dcpu=baseline
 ```
@@ -127,13 +147,39 @@ library will be in `/tmp/pkg/usr/lib/`). The installed pkg-config and CMake
 files refer to `/usr`, where the files will be once your package is
 installed, and never to `/tmp/pkg`.
 
+The dependency tarball contains exactly the packages that
+`deps/libghostty-vt.txt` lists. Each package is already unpacked into its
+own directory, named by its Zig package hash. This is the layout Zig's own
+package cache uses, which is why `--system` can read it directly:
+
+```
+libghostty-vt-1.0.0-deps/
+  uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv/
+  N-V-__8AAGmZhABbsPJLfbqrh6JTHsXhY6qCaLAQyx25e0XE/
+  ...
+```
+
+**Without the dependency tarball**, for example when building from a Git
+checkout or a tip source tarball, fetch the packages yourself first. This
+step needs internet access and Zig. `deps/libghostty-vt.txt` lists only
+the packages the library needs, so it downloads far less than a Ghostty app
+build would:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR=/tmp/offline-cache \
+  ./nix/build-support/fetch-zig-cache.sh deps/libghostty-vt.txt
+```
+
+Then build as in step 2, with `--system /tmp/offline-cache/p` instead.
+
 > [!IMPORTANT]
 >
 > `ZIG_GLOBAL_CACHE_DIR` in the build step must be a new, empty directory,
-> not the one the fetch step filled. With Zig 0.17, reusing the fetch
-> cache can crash the build with "reached unreachable code" instead of a
-> useful error. An empty cache also proves that the build used only the
-> packages you fetched.
+> not `~/.cache/zig` or the one the fetch step filled. With Zig 0.17, a
+> cache that holds an archive of a package can crash the build with
+> "reached unreachable code" instead of a useful error. An empty cache also
+> proves that the build used only the packages in the `--system`
+> directory.
 
 ## Installed Files
 
@@ -153,9 +199,13 @@ other Unix systems:
 
 On macOS, the shared library files are named `libghostty-vt.X.Y.Z.dylib`,
 `libghostty-vt.X.dylib` and `libghostty-vt.dylib`, and programs load it as
-`@rpath/libghostty-vt.X.dylib`. On Windows, the DLL is installed to `bin/`
-instead, and `lib/` holds the import library `ghostty-vt.lib` and the
-static library `ghostty-vt-static.lib`.
+`@rpath/libghostty-vt.X.dylib`. On Windows, the DLL `ghostty-vt.dll` and
+its debug information `ghostty-vt.pdb` are installed to `bin/` instead,
+and `lib/` holds the import library `ghostty-vt.lib` and the static
+library `ghostty-vt-static.lib`. The DLL and import library names carry no
+major version, so side-by-side installs are not supported on Windows.
+Each release publishes this tree as a zip for x86_64 and aarch64, with
+`LICENSE` and a `README.md` at its root.
 
 Most distributions split these into a runtime package with the versioned
 shared library and its SONAME symlink, and a development package with
@@ -177,8 +227,9 @@ particularly relevant to package maintainers:
   `--prefix-lib-dir lib64` for a distribution that keeps libraries in
   `/usr/lib64`.
 
-- `--system`: The path to the offline cache directory. This disables
-  any package fetching from the internet.
+- `--system`: The directory that holds the Zig packages, such as the
+  unpacked dependency tarball. This disables any package fetching from
+  the internet.
 
 - `-Doptimize=ReleaseFast`: Build with optimizations enabled and safety
   checks disabled. This is the recommended build mode for distribution.
@@ -232,46 +283,47 @@ libghostty-vt's version is set by `lib_version` in `build.zig` and recorded
 in the tarball's `LIB_VERSION` file. It is independent of the Ghostty app
 version.
 
-**Before 1.0, any minor release may break compatibility.** A program built
-against libghostty-vt 0.1 may not build or run with 0.2. Patch releases,
-such as 0.1.1, never break compatibility. When libghostty-vt's minor
-version changes, rebuild every package that depends on it:
+**libghostty-vt follows semantic versioning.** A release that breaks
+compatibility gets a new major version and a new SONAME. Minor and patch releases only add to the library, so
+dependent packages only need a rebuild when the major version changes:
 
-| Update         | Rebuild dependent packages? |
-| -------------- | --------------------------- |
-| 0.1.0 to 0.1.1 | No                          |
-| 0.1.1 to 0.2.0 | Yes                         |
-| 1.2.0 to 1.3.0 | No                          |
-| 1.3.0 to 2.0.0 | Yes                         |
+| Update              | Rebuild dependent packages? |
+| ------------------- | --------------------------- |
+| 1.2.0 to 1.3.0      | No                          |
+| A new major version | Yes                         |
 
 The shared library's SONAME only includes the major version, so it is
-`libghostty-vt.so.0` for every 0.x release. This means the system can't
-tell 0.1 and 0.2 apart, which is why the rebuild is needed. Programs can
-also check the version themselves, with the macros in
-`<ghostty/vt/version.h>` when they are compiled and with
-`ghostty_version()` when they run.
+`libghostty-vt.so.1` for every 1.x release. Programs can also check the
+version themselves, with the macros in `<ghostty/vt/version.h>` when they
+are compiled and with `ghostty_version()` when they run.
 
 On Linux and FreeBSD, the shared library exports only the `ghostty_*`
-functions, and each one carries the symbol version `GHOSTTY_VT_0`. You can
-see it with `readelf --dyn-syms`, which lists names such as
-`ghostty_terminal_new@@GHOSTTY_VT_0`. At 1.0 the version becomes
-`GHOSTTY_VT_1.0`, so the loader refuses to run a program built against 0.x
-with a 1.0 library instead of letting it fail later.
+functions, and each one carries a symbol version. You can see it with
+`readelf --dyn-syms`, which lists names such as
+`ghostty_terminal_new@@GHOSTTY_VT_1.0`. The functions of 1.0 carry
+`GHOSTTY_VT_1.0`, and each later minor release adds a node that lists only
+the functions it added.
 
-**From 1.0, libghostty-vt follows semantic versioning.** A release that
-breaks compatibility gets a new major version and a new SONAME, such as
-`libghostty-vt.so.2`. Minor and patch releases only add to the library.
+On macOS, the shared library also records a compatibility version (`X.0.0`)
+and a current version (`X.Y.Z`). The macOS loader doesn't check them, so
+follow the same rebuild rule there.
 
-On macOS, the shared library also records a compatibility version
-(`0.N.0` before 1.0, then `X.0.0`) and a current version (`X.Y.Z`). The
-macOS loader doesn't check them, so follow the same rebuild rule there.
+Our CI compares the ABI of every change to a baseline, so that the ABI
+doesn't break by accident. See [`test/abi/`](https://github.com/ghostty-org/ghostty/tree/main/test/abi) for how
+the check works. CI also runs `zig build test-lib-vt-abi` for Linux, macOS
+and WebAssembly. It compares the library to reference files, called goldens,
+in `src/terminal/c/abi/`: one manifest of the public types per target, and
+`symbols.txt`, the list of public functions. The check fails on anything
+that isn't an addition, such as a new function, a new type, a new enum value
+or a new field at the end of a sized struct. Maintainers record an intentional
+addition with `zig build update-lib-vt-abi`. You don't need to run either
+step to package the library.
 
 ## Package Names
 
 Please name the runtime package according to your distribution's policy
 for shared libraries. Policies that name packages after the SONAME, such
-as Debian's, give `libghostty-vt0` for every 0.x release and
-`libghostty-vt1` after 1.0. Distributions such as Fedora, Arch and nixpkgs
+as Debian's, give `libghostty-vt1` for every 1.x release. Distributions such as Fedora, Arch and nixpkgs
 use `libghostty-vt` for every version. The source package, the pkg-config
 module and the `-lghostty-vt` linker flag are always `libghostty-vt`.
 
@@ -293,14 +345,12 @@ cc -o myapp main.c $(pkg-config --static --cflags --libs libghostty-vt-static)
 Or with CMake:
 
 ```cmake
-find_package(ghostty-vt 0.1 REQUIRED)
+find_package(ghostty-vt 1.0 REQUIRED)
 target_link_libraries(myapp PRIVATE ghostty-vt::ghostty-vt)
 ```
 
-Before 1.0, the CMake package only accepts a request from the same minor
-version. A request for `0.1` accepts any installed 0.1.x but not 0.2.0.
-From 1.0, it accepts any installed version with the same major version.
-See [`dist/cmake/README.md`](dist/cmake/README.md) for the other CMake
+The CMake package accepts any installed version with the same major
+version, as long as it is at least as new as the request. See [`dist/cmake/README.md`](dist/cmake/README.md) for the other CMake
 targets, building through CMake, and cross-compiling.
 
 ## Third-Party Code
@@ -333,9 +383,10 @@ The license texts are in these places:
 - libghostty-vt: `LICENSE` at the root of the tarball.
 - simdutf: `pkg/simdutf/vendor/`, since simdutf is included in the
   tarball.
-- Every other linked project: in the directory the fetch step unpacked
-  it to, `/tmp/offline-cache/p/<hash>` in the example above, where
-  `<hash>` is the entry's `hash` field.
+- Every other linked project: in its package directory,
+  `libghostty-vt-VERSION-deps/<hash>` in the unpacked dependency tarball
+  (or `/tmp/offline-cache/p/<hash>` if you fetched the packages yourself),
+  where `<hash>` is the entry's `hash` field.
 
 [`deps/README.md`](deps/README.md) describes this file and the other
 generated dependency lists.
@@ -347,7 +398,7 @@ To run the library's tests, use the same offline setup as the build:
 ```sh
 ZIG_GLOBAL_CACHE_DIR=/tmp/build-cache \
 zig build test-lib-vt \
-  --system /tmp/offline-cache/p
+  --system ../libghostty-vt-1.0.0-deps
 ```
 
 To check the installed files, compile and run a small program against
@@ -373,16 +424,22 @@ On macOS, use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH`. For a
 release, the program prints the same version twice:
 
 ```
-headers 0.1.0, library 0.1.0
+headers 1.0.0, library 1.0.0
 ```
 
 ## Platform Support
 
-| Tier | Meaning                    | Platforms                                                                                                                               |
-| ---- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | Built and tested in CI     | Linux x86_64 and aarch64 (glibc and musl), macOS 13+, iOS 13+, FreeBSD x86_64 and aarch64, Windows x86_64, wasm32-freestanding, Android |
-| 2    | Built in CI but not tested | riscv32 and thumb freestanding                                                                                                          |
-| 3    | Best effort, not in CI     | wasm32-wasi, illumos, Windows arm64, 32-bit x86                                                                                         |
+| Tier | Meaning                    | Platforms                                                                                                                                         |
+| ---- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | Built and tested in CI     | Linux x86_64 and aarch64 (glibc and musl), macOS 13+, iOS 13+, FreeBSD x86_64 and aarch64, Windows x86_64 (gnu ABI), wasm32-freestanding, Android |
+| 2    | Built in CI but not tested | riscv32 and thumb freestanding, Windows aarch64 (gnu ABI)                                                                                         |
+| 3    | Best effort, not in CI     | wasm32-wasi, illumos, 32-bit x86                                                                                                                  |
+
+On Windows, the library is built for the gnu ABI, which is what Zig picks
+by default. Programs built with MSVC can still link it through the import
+library, and CI does this for the CMake examples. Each release also
+publishes a prebuilt zip for Windows aarch64. It is built like the x86_64
+zip but isn't run, so it stays Tier 2.
 
 ## WebAssembly
 

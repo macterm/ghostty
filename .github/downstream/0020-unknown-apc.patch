@@ -23,20 +23,20 @@ bytes and the cut flag, and frees the request after the action. The
 native apprts take the action as a no-op. The tag is appended last in
 both enums, so the existing values do not change.
 ---
- include/ghostty.h                       | 12 +++++++
- macos/Sources/Ghostty/Ghostty.App.swift |  4 +++
- src/Surface.zig                         | 11 +++++++
- src/apprt/action.zig                    | 42 +++++++++++++++++++++++++
- src/apprt/gtk/class/application.zig     |  3 ++
- src/apprt/surface.zig                   | 10 ++++++
- src/termio/stream_handler.zig           | 22 +++++++++++--
+ include/ghostty.h                       | 12 ++++++++++
+ macos/Sources/Ghostty/Ghostty.App.swift |  4 ++++
+ src/Surface.zig                         | 11 +++++++++
+ src/apprt/action.zig                    | 42 +++++++++++++++++++++++++++++++++
+ src/apprt/gtk/class/application.zig     |  3 +++
+ src/apprt/surface.zig                   | 10 ++++++++
+ src/termio/stream_handler.zig           | 22 +++++++++++++++--
  7 files changed, 102 insertions(+), 2 deletions(-)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
-index 41ad0e164..e0160edd6 100644
+index 9fe69cbbb..da573d97f 100644
 --- a/include/ghostty.h
 +++ b/include/ghostty.h
-@@ -946,6 +946,16 @@ typedef struct {
+@@ -954,6 +954,16 @@ typedef struct {
    const char* GHOSTTY_NULLABLE command;
  } ghostty_action_command_finished_s;
  
@@ -53,15 +53,15 @@ index 41ad0e164..e0160edd6 100644
  // apprt.action.StartSearch.C
  typedef struct {
    const char* needle;
-@@ -1041,6 +1051,7 @@ typedef enum {
-   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+@@ -1050,6 +1060,7 @@ typedef enum {
    GHOSTTY_ACTION_RESIZE_WINDOW,
+   GHOSTTY_ACTION_SET_WINDOW_THEME,
    GHOSTTY_ACTION_OUTPUT_ACTIVITY,
 +  GHOSTTY_ACTION_UNKNOWN_APC,
  } ghostty_action_tag_e;
  
  typedef union {
-@@ -1081,6 +1092,7 @@ typedef union {
+@@ -1090,6 +1101,7 @@ typedef union {
    ghostty_surface_message_childexited_s child_exited;
    ghostty_action_progress_report_s progress_report;
    ghostty_action_command_finished_s command_finished;
@@ -70,10 +70,10 @@ index 41ad0e164..e0160edd6 100644
    ghostty_action_search_total_s search_total;
    ghostty_action_search_selected_s search_selected;
 diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
-index 680cdcf80..eded393a1 100644
+index 69f0685a0..fc1a1012b 100644
 --- a/macos/Sources/Ghostty/Ghostty.App.swift
 +++ b/macos/Sources/Ghostty/Ghostty.App.swift
-@@ -745,6 +745,10 @@ extension Ghostty {
+@@ -748,6 +748,10 @@ extension Ghostty {
              case GHOSTTY_ACTION_OUTPUT_ACTIVITY:
                  break
  
@@ -107,10 +107,10 @@ index f8056541d..7215ffbfd 100644
              defer w.deinit();
  
 diff --git a/src/apprt/action.zig b/src/apprt/action.zig
-index 793071322..4acd47638 100644
+index b531ec4a5..69f7e88ce 100644
 --- a/src/apprt/action.zig
 +++ b/src/apprt/action.zig
-@@ -374,6 +374,15 @@ pub const Action = union(Key) {
+@@ -376,6 +376,15 @@ pub const Action = union(Key) {
      /// geometry, matching `scrollbar`.
      output_activity: terminal.Scrollbar,
  
@@ -126,15 +126,15 @@ index 793071322..4acd47638 100644
      /// Sync with: ghostty_action_tag_e
      pub const Key = enum(c_int) {
          quit,
-@@ -447,6 +456,7 @@ pub const Action = union(Key) {
-         move_tab_to_new_window,
+@@ -450,6 +459,7 @@ pub const Action = union(Key) {
          resize_window,
+         set_window_theme,
          output_activity,
 +        unknown_apc,
  
          test "ghostty.h Action.Key" {
              try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
-@@ -1043,6 +1053,38 @@ pub const CommandFinished = struct {
+@@ -1057,6 +1067,38 @@ pub const CommandFinished = struct {
      }
  };
  
@@ -174,10 +174,10 @@ index 793071322..4acd47638 100644
      needle: [:0]const u8,
  
 diff --git a/src/apprt/gtk/class/application.zig b/src/apprt/gtk/class/application.zig
-index 680261f63..26dba0b38 100644
+index 902f790d9..70d8f10c2 100644
 --- a/src/apprt/gtk/class/application.zig
 +++ b/src/apprt/gtk/class/application.zig
-@@ -778,6 +778,9 @@ pub const Application = extern struct {
+@@ -783,6 +783,9 @@ pub const Application = extern struct {
              // Reserved for embedders that consume activity heartbeats.
              .output_activity => {},
  
