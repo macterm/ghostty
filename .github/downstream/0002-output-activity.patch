@@ -23,11 +23,11 @@ ghostty_action_tag_e so existing tag values remain unchanged.
  include/ghostty.h                       |  2 +
  macos/Sources/Ghostty/Ghostty.App.swift |  4 ++
  src/Surface.zig                         | 18 +++++++++
- src/apprt/action.zig                    | 10 +++++
+ src/apprt/action.zig                    | 11 ++++++
  src/apprt/gtk/class/application.zig     |  3 ++
  src/apprt/surface.zig                   |  9 +++++
  src/termio/Termio.zig                   | 68 +++++++++++++++++++++++++++++++++
- 7 files changed, 114 insertions(+)
+ 7 files changed, 115 insertions(+)
 
 diff --git a/include/ghostty.h b/include/ghostty.h
 index e29090264..3bae55762 100644
@@ -101,13 +101,13 @@ index 98ad00f30..6c4727063 100644
  /// so that the apprt can reload the configuration.
  fn notifyConfigConditionalState(self: *Surface) void {
 diff --git a/src/apprt/action.zig b/src/apprt/action.zig
-index 0cacc0492..b45bed11a 100644
+index 0cacc0492..96c9c411a 100644
 --- a/src/apprt/action.zig
 +++ b/src/apprt/action.zig
-@@ -366,6 +366,15 @@ pub const Action = union(Key) {
- 
+@@ -367,6 +367,16 @@ pub const Action = union(Key) {
      /// Set the application window theme for this session.
      set_window_theme: WindowTheme,
+ 
 +    /// A throttled heartbeat emitted from the IO path whenever the
 +    /// child/pty produces output. Unlike `scrollbar` (a renderer-track
 +    /// action that stops while the surface is occluded), this is delivered
@@ -117,10 +117,11 @@ index 0cacc0492..b45bed11a 100644
 +    /// or run in background tabs. The payload is the current scrollbar
 +    /// geometry, matching `scrollbar`.
 +    output_activity: terminal.Scrollbar,
- 
++
      /// Sync with: ghostty_action_tag_e
      pub const Key = enum(c_int) {
-@@ -440,6 +449,7 @@ pub const Action = union(Key) {
+         quit,
+@@ -440,6 +450,7 @@ pub const Action = union(Key) {
          move_tab_to_new_window,
          resize_window,
          set_window_theme,

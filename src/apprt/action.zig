@@ -366,6 +366,7 @@ pub const Action = union(Key) {
 
     /// Set the application window theme for this session.
     set_window_theme: WindowTheme,
+
     /// A throttled heartbeat emitted from the IO path whenever the
     /// child/pty produces output. Unlike `scrollbar` (a renderer-track
     /// action that stops while the surface is occluded), this is delivered
