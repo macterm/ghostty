@@ -1057,10 +1057,10 @@ palette: Palette = .{},
 
 /// With `smooth-cursor` on, let the moving cursor change its shape with its
 /// speed: it stretches along the direction it moves and gets thinner
-/// across it, so its area stays the same, and it is back to its own shape
-/// when it lands. A block, bar or underline cursor stretches in the same
-/// way. Moves of a cell or two, such as typing or a new line, stretch
-/// little or not at all. Has no effect without `smooth-cursor`.
+/// across it, and it is back to its own shape when it lands. A block
+/// cursor keeps its area. A bar or underline cursor stretches as far as a
+/// block cursor would. A move of one row or less, such as typing or a new
+/// line, does not stretch. Has no effect without `smooth-cursor`.
 ///
 /// Downstream (thdxg/ghostty) key, read by Macterm's Animations settings.
 /// This can be changed at runtime.
