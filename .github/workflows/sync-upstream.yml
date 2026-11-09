@@ -61,6 +61,7 @@ env:
     .github/downstream/0018-selection-scroll-ease.patch
     .github/downstream/0019-command-text.patch
     .github/downstream/0020-unknown-apc.patch
+    .github/downstream/0021-cursor-morph.patch
 
 jobs:
   sync:

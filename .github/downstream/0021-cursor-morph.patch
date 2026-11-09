@@ -1,0 +1,241 @@
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index e258db964..37e58b6d1 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -1055,6 +1055,17 @@ palette: Palette = .{},
+ /// This can be changed at runtime.
+ @"cursor-trail": bool = false,
+ 
++/// With `smooth-cursor` on, let the moving cursor change its shape with its
++/// speed: it stretches along the direction it moves and gets thinner
++/// across it, so its area stays the same, and it is back to its own shape
++/// when it lands. A block, bar or underline cursor stretches in the same
++/// way. Moves of a cell or two, such as typing or a new line, stretch
++/// little or not at all. Has no effect without `smooth-cursor`.
++///
++/// Downstream (thdxg/ghostty) key, read by Macterm's Animations settings.
++/// This can be changed at runtime.
++@"cursor-morph": bool = false,
++
+ /// The opacity level (opposite of transparency) of the background. A value of
+ /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
+ /// or greater than 1 will be clamped to the nearest valid value.
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 859a32c9d..079474f65 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -171,12 +171,17 @@ const CursorGlide = struct {
+         return self.start != null;
+     }
+ 
+-    /// Advance to `now` and return the rect to draw.
+-    fn step(self: *CursorGlide, now: std.Io.Timestamp) [4]f32 {
++    /// Advance to `now` and return the rect to draw. Under `cursor-morph`
++    /// `morph_cell_height` is the cell height and the rect is `morphAt`'s;
++    /// otherwise it is null and the rect is `rectAt`'s.
++    fn step(self: *CursorGlide, now: std.Io.Timestamp, morph_cell_height: ?f32) [4]f32 {
+         const start = self.start orelse return self.to;
+         const elapsed_ns: f64 = @floatFromInt(@max(start.durationTo(now).nanoseconds, 0));
+         const elapsed_s = elapsed_ns / std.time.ns_per_s;
+-        self.current = rectAt(self.from, self.to, elapsed_s);
++        self.current = if (morph_cell_height) |cell_height|
++            morphAt(self.from, self.to, elapsed_s, cell_height)
++        else
++            rectAt(self.from, self.to, elapsed_s);
+         self.progress = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
+         self.frames += 1;
+         if (elapsed_s >= duration_s) {
+@@ -198,8 +203,155 @@ const CursorGlide = struct {
+         for (&rect, from, to) |*out, a, b| out.* = a + (b - a) * e;
+         return rect;
+     }
++
++    /// `cursor-morph`: the most the cursor stretches along its motion, as
++    /// a multiple of its own length that way.
++    pub const morph_max_stretch: f32 = 2.5;
++
++    /// The rect `elapsed_s` into a glide under `cursor-morph`: the
++    /// `rectAt` rect, stretched along the motion and thinned across it by
++    /// the same factor, so its area stays the same.
++    ///
++    /// On each axis the trailing edge eases as the glide does (cubic) and
++    /// the leading edge faster (quintic). Their gap is zero when the glide
++    /// sets out, grows with the speed, and is almost zero again in the
++    /// last frames before the cursor lands, and each edge only moves
++    /// toward where it is going, so nothing overshoots. The gap sets the stretch,
++    /// limited softly to `morph_max_stretch`. A move of one cell height or
++    /// less, such as typing or a new line, does not stretch; the stretch
++    /// grows to its full amount at two cell heights.
++    ///
++    /// The rect stays axis-aligned, so a diagonal move stretches both
++    /// ways and thins neither by much.
++    fn morphAt(from: [4]f32, to: [4]f32, elapsed_s: f64, cell_height: f32) [4]f32 {
++        const rect = rectAt(from, to, elapsed_s);
++        const t = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
++        if (t <= 0 or t >= 1 or cell_height <= 0) return rect;
++
++        const from_c = center(from);
++        const to_c = center(to);
++        const dx = to_c[0] - from_c[0];
++        const dy = to_c[1] - from_c[1];
++        const amount = std.math.clamp(@sqrt(dx * dx + dy * dy) / cell_height - 1.0, 0.0, 1.0);
++        if (amount == 0) return rect;
++
++        const u = 1.0 - t;
++        const leading: f32 = @floatCast(1.0 - u * u * u * u * u);
++        const trailing: f32 = @floatCast(1.0 - u * u * u);
++        const room = morph_max_stretch - 1.0;
++
++        var mid: [2]f32 = undefined;
++        var len: [2]f32 = undefined;
++        var stretch: [2]f32 = .{ 1, 1 };
++        for (0..2) |i| {
++            const natural = rect[i + 2];
++            mid[i] = rect[i] + natural * 0.5;
++            len[i] = natural;
++            const d = to_c[i] - from_c[i];
++            if (d == 0 or natural <= 0) continue;
++
++            // The edges as the leading and trailing eases put them, then
++            // moved toward the `rectAt` edges for a short move.
++            const lo_ease, const hi_ease = if (d > 0) .{ trailing, leading } else .{ leading, trailing };
++            const lo = from[i] + (to[i] - from[i]) * lo_ease;
++            const hi = from[i] + from[i + 2] +
++                (to[i] + to[i + 2] - from[i] - from[i + 2]) * hi_ease;
++            const lo_b = rect[i] + (lo - rect[i]) * amount;
++            const hi_b = rect[i] + natural + (hi - rect[i] - natural) * amount;
++
++            const extra = @max((hi_b - lo_b) / natural - 1.0, 0.0);
++            stretch[i] = 1.0 + room * std.math.tanh(extra / room);
++            mid[i] = (lo_b + hi_b) * 0.5;
++            len[i] = natural * stretch[i];
++        }
++
++        // Each side gets thinner by the stretch of the other, to keep the
++        // area, but never thinner than a pixel.
++        var out: [4]f32 = undefined;
++        for (0..2) |i| {
++            const size = @max(len[i] / stretch[1 - i], @min(rect[i + 2], 1.0));
++            out[i] = mid[i] - size * 0.5;
++            out[i + 2] = size;
++        }
++        return out;
++    }
+ };
+ 
++test "CursorGlide morph stretches a long move along its motion and lands exactly" {
++    const testing = std.testing;
++    const cell_h: f32 = 20;
++    const from: [4]f32 = .{ 0, 0, 10, cell_h };
++    const to: [4]f32 = .{ 200, 0, 10, cell_h };
++    const d = CursorGlide.duration_s;
++
++    // It sets out from and lands on the cells exactly.
++    try testing.expectEqual(from, CursorGlide.morphAt(from, to, 0, cell_h));
++    try testing.expectEqual(to, CursorGlide.morphAt(from, to, d, cell_h));
++    try testing.expectEqual(to, CursorGlide.morphAt(from, to, 10, cell_h));
++
++    // On the way it is longer, thinner, of the same area, centered on
++    // the row, no longer than the limit, and inside the path.
++    var steps: usize = 1;
++    var peak: f32 = 0;
++    while (steps < 20) : (steps += 1) {
++        const t = d * @as(f64, @floatFromInt(steps)) / 20.0;
++        const r = CursorGlide.morphAt(from, to, t, cell_h);
++        try testing.expect(r[2] > 10);
++        try testing.expect(r[2] <= 10 * CursorGlide.morph_max_stretch + 0.001);
++        try testing.expect(r[3] < cell_h);
++        try testing.expectApproxEqAbs(@as(f32, 10 * cell_h), r[2] * r[3], 0.01);
++        try testing.expectApproxEqAbs(@as(f32, cell_h / 2), r[1] + r[3] / 2, 0.001);
++        try testing.expect(r[0] >= 0 and r[0] + r[2] <= 210);
++        peak = @max(peak, r[2]);
++    }
++    // The stretch comes back down as it lands.
++    const late = CursorGlide.morphAt(from, to, d * 0.95, cell_h);
++    try testing.expect(late[2] < peak);
++    try testing.expect(late[2] < 11);
++
++    // Moving the other way is the mirror image.
++    const ahead = CursorGlide.morphAt(from, to, d * 0.3, cell_h);
++    const back = CursorGlide.morphAt(to, from, d * 0.3, cell_h);
++    try testing.expectApproxEqAbs(ahead[2], back[2], 0.001);
++    try testing.expectApproxEqAbs(ahead[3], back[3], 0.001);
++    try testing.expectApproxEqAbs(ahead[0] + ahead[2], 210 - back[0], 0.001);
++}
++
++test "CursorGlide morph follows the speed and leaves typing alone" {
++    const testing = std.testing;
++    const cell_h: f32 = 20;
++    const from: [4]f32 = .{ 0, 0, 10, cell_h };
++    const d = CursorGlide.duration_s;
++
++    // Typing and a new line: the rect of the plain glide.
++    for ([_][4]f32{ .{ 10, 0, 10, cell_h }, .{ 0, cell_h, 10, cell_h }, .{ 20, 0, 10, cell_h } }) |to| {
++        var steps: usize = 0;
++        while (steps <= 10) : (steps += 1) {
++            const t = d * @as(f64, @floatFromInt(steps)) / 10.0;
++            try testing.expectEqual(CursorGlide.rectAt(from, to, t), CursorGlide.morphAt(from, to, t, cell_h));
++        }
++    }
++
++    // A faster move (farther in the same time) stretches more, up to the
++    // limit.
++    const t = d * 0.3;
++    const short = CursorGlide.morphAt(from, .{ 40, 0, 10, cell_h }, t, cell_h);
++    const medium = CursorGlide.morphAt(from, .{ 80, 0, 10, cell_h }, t, cell_h);
++    const long = CursorGlide.morphAt(from, .{ 2000, 0, 10, cell_h }, t, cell_h);
++    try testing.expect(short[2] > 10 and short[2] < medium[2] and medium[2] < long[2]);
++    try testing.expect(long[2] <= 10 * CursorGlide.morph_max_stretch + 0.001);
++
++    // A vertical move stretches the height and thins the width.
++    const down = CursorGlide.morphAt(from, .{ 0, 400, 10, cell_h }, t, cell_h);
++    try testing.expect(down[3] > cell_h and down[2] < 10);
++    try testing.expectApproxEqAbs(@as(f32, 5), down[0] + down[2] / 2, 0.001);
++
++    // A bar keeps at least a pixel of width.
++    const bar: [4]f32 = .{ 0, 0, 2, cell_h };
++    const bar_down = CursorGlide.morphAt(bar, .{ 0, 400, 2, cell_h }, t, cell_h);
++    try testing.expect(bar_down[3] > cell_h and bar_down[2] >= 1);
++}
++
+ test "CursorGlide eases out from where it is and lands exactly" {
+     const testing = std.testing;
+     const from: [4]f32 = .{ 0, 0, 10, 20 };
+@@ -950,6 +1102,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             smooth_scroll_rows: bool,
+             smooth_cursor: bool,
+             cursor_trail: bool,
++            cursor_morph: bool,
+             custom_shader_animation: configpkg.CustomShaderAnimation,
+ 
+             pub fn init(
+@@ -1030,6 +1183,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     .smooth_scroll_rows = config.@"smooth-scroll-rows",
+                     .smooth_cursor = config.@"smooth-cursor",
+                     .cursor_trail = config.@"cursor-trail",
++                    .cursor_morph = config.@"cursor-morph",
+                     .custom_shader_animation = config.@"custom-shader-animation",
+                     .arena = arena,
+                 };
+@@ -1822,7 +1976,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             if (!self.cursor_glide_shown) return;
+             const glide: *CursorGlide = if (self.cursor_glide) |*g| g else return;
+ 
+-            const rect = glide.step(.now(global.io(), .awake));
++            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
++            const morph: ?f32 = if (self.config.smooth_cursor and self.config.cursor_morph)
++                cell_h
++            else
++                null;
++            const rect = glide.step(.now(global.io(), .awake), morph);
+             const shift: f32 = shift: {
+                 const col: u32 = glide.cell[0];
+                 const row: u32 = glide.cell[1];
+@@ -1839,7 +1998,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 self.uniforms.cursor_rect = .{ rect[0], rect[1] + shift, rect[2], rect[3] };
+             }
+             if (self.config.cursor_trail) {
+-                const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                 if (glide.trail(cell_h)) |trail| {
+                     self.uniforms.cursor_trail = .{
+                         trail.from[0], trail.from[1] + shift,
