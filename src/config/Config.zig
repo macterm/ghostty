@@ -1055,6 +1055,17 @@ palette: Palette = .{},
 /// This can be changed at runtime.
 @"cursor-trail": bool = false,
 
+/// With `smooth-cursor` on, let the moving cursor change its shape with its
+/// speed: it stretches along the direction it moves and gets thinner
+/// across it, and it is back to its own shape when it lands. A block
+/// cursor keeps its area. A bar or underline cursor stretches as far as a
+/// block cursor would. A move of one row or less, such as typing or a new
+/// line, does not stretch. Has no effect without `smooth-cursor`.
+///
+/// Downstream (thdxg/ghostty) key, read by Macterm's Animations settings.
+/// This can be changed at runtime.
+@"cursor-morph": bool = false,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.
