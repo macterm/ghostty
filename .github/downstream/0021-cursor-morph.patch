@@ -22,21 +22,24 @@ index e258db964..50eb2fc20 100644
  /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
  /// or greater than 1 will be clamped to the nearest valid value.
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index 859a32c9d..ad646e35b 100644
+index 859a32c9d..2e7f55e16 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
-@@ -74,7 +74,9 @@ const log = std.log.scoped(.generic_renderer);
+@@ -74,8 +74,11 @@ const log = std.log.scoped(.generic_renderer);
  /// fills it (`Uniforms.cursor_rect` / `cursor_fill`) and, for a block
  /// cursor, the text shader colors every glyph as cursor text by how much
  /// of each pixel the rect covers (`cursor_glide_text`), which is what a
 -/// cursor halfway across a glyph looks like. The sprite is still added at
+-/// alpha 0 so the custom shader uniforms keep describing the cursor's cell.
 +/// cursor halfway across a glyph looks like. Under `cursor-morph` a block
 +/// cursor is a comet while it glides (`Comet`), and both shaders fill and
-+/// color by the comet's coverage in place of the rect's. The sprite is still added at
- /// alpha 0 so the custom shader uniforms keep describing the cursor's cell.
++/// color by the comet's coverage in place of the rect's. The sprite is
++/// still added at alpha 0 so the custom shader uniforms keep describing
++/// the cursor's cell.
  const CursorGlide = struct {
      /// The grid cell aimed at, for the region scroll shift.
-@@ -86,6 +88,13 @@ const CursorGlide = struct {
+     cell: [2]u16,
+@@ -86,6 +89,13 @@ const CursorGlide = struct {
      start: ?std.Io.Timestamp,
      /// The rect last drawn, which a retarget mid-glide sets out from.
      current: [4]f32,
@@ -50,7 +53,7 @@ index 859a32c9d..ad646e35b 100644
      /// Frames drawn since the glide began, for the log line when it lands.
      frames: u32 = 0,
      /// How far along the glide is, 0 to 1; 1 at rest.
-@@ -156,10 +165,13 @@ const CursorGlide = struct {
+@@ -156,10 +166,13 @@ const CursorGlide = struct {
      /// Aim at `rect`. The rect already aimed at changes nothing; any
      /// other starts a glide from wherever the rect is drawn now, so a
      /// cursor retargeted mid-glide turns toward the new place instead of
@@ -65,7 +68,7 @@ index 859a32c9d..ad646e35b 100644
          self.from = self.current;
          self.to = rect;
          self.start = now;
-@@ -171,12 +183,25 @@ const CursorGlide = struct {
+@@ -171,12 +184,26 @@ const CursorGlide = struct {
          return self.start != null;
      }
  
@@ -73,8 +76,9 @@ index 859a32c9d..ad646e35b 100644
 -    fn step(self: *CursorGlide, now: std.Io.Timestamp) [4]f32 {
 -        const start = self.start orelse return self.to;
 +    /// Advance to `now` and return the rect to draw. With `comet_cell_h`,
-+    /// the cell height, it also sets `comet` to the shape the rect turns
-+    /// into under `cursor-morph`; without it, `comet` is null.
++    /// the cell height under `cursor-morph`, it also sets `comet` to the
++    /// shape a block cursor turns into; without it, or for a cursor that
++    /// is not a block, `comet` is null.
 +    fn step(self: *CursorGlide, now: std.Io.Timestamp, comet_cell_h: ?f32) [4]f32 {
 +        const start = self.start orelse {
 +            self.comet = null;
@@ -89,13 +93,13 @@ index 859a32c9d..ad646e35b 100644
 +    fn advance(self: *CursorGlide, elapsed_s: f64, comet_cell_h: ?f32) [4]f32 {
          self.current = rectAt(self.from, self.to, elapsed_s);
 +        self.comet = if (comet_cell_h) |cell_h|
-+            Comet.at(self.from, self.to, elapsed_s, cell_h, self.carry)
++            if (self.block) Comet.at(self.from, self.to, elapsed_s, cell_h, self.carry) else null
 +        else
 +            null;
          self.progress = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
          self.frames += 1;
          if (elapsed_s >= duration_s) {
-@@ -198,8 +223,231 @@ const CursorGlide = struct {
+@@ -198,8 +225,269 @@ const CursorGlide = struct {
          for (&rect, from, to) |*out, a, b| out.* = a + (b - a) * e;
          return rect;
      }
@@ -148,7 +152,7 @@ index 859a32c9d..ad646e35b 100644
 +
 +        /// The comet `elapsed_s` into a glide from `from` to `to`, or null
 +        /// where the cursor is its rect: at rest, as it sets out and lands,
-+        /// and for a short move. `carry` is what the glide before it left.
++        /// and for a short move. `carried` is what the glide before it left.
 +        fn at(from: [4]f32, to: [4]f32, elapsed_s: f64, cell_h: f32, carried: Carry) ?Comet {
 +            const t = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
 +            if (t >= 1 or cell_h <= 0) return null;
@@ -164,9 +168,9 @@ index 859a32c9d..ad646e35b 100644
 +
 +            // The head is on the glide's rect, the tail where the head was
 +            // `lag` ago. A carried tail joins that path within `lag`. The
-+            // body gets shorter with the cube of the weight, so the comet
-+            // is back in its head before it turns into the block: a body
-+            // mixed with the block makes a point.
++            // body gets shorter with the cube of the weight, so the body
++            // is gone before the comet turns back into the block. A body
++            // mixed with the block draws a sharp point.
 +            const rect = rectAt(from, to, elapsed_s);
 +            const head = center(rect);
 +            const behind: f32 = @floatCast(ease(@max(t - lag, 0)));
@@ -292,6 +296,7 @@ index 859a32c9d..ad646e35b 100644
 +
 +    // A held key: a new target every 33 ms, each one 100 px on.
 +    var glide: CursorGlide = .resting(.{ 0, 0 }, .{ 0, 0, 10, 20 });
++    glide.block = true;
 +    var x: f32 = 0;
 +    var last: ?CursorGlide.Comet = null;
 +    var repeats: usize = 0;
@@ -318,16 +323,53 @@ index 859a32c9d..ad646e35b 100644
 +    try testing.expect(glide.comet == null);
 +    try testing.expect(!glide.inFlight());
 +
-+    // Without `cursor-morph` there is no comet.
++    // Typing right after a jump: the comet goes on into the short move
++    // with no jump, and is the block when it lands.
 +    glide.retarget(.{ 0, 0 }, .{ 0, 0, 10, 20 }, t0);
-+    _ = glide.advance(0.05, null);
++    _ = glide.advance(0.033, h);
++    const before = glide.comet.?;
++    const typed: [4]f32 = .{ glide.current[0] - 10, 0, 10, 20 };
++    glide.retarget(.{ 0, 0 }, typed, t0);
++    _ = glide.advance(0, h);
++    const now = glide.comet.?;
++    for (0..2) |k| {
++        try testing.expectApproxEqAbs(before.head[k], now.head[k], 0.001);
++        try testing.expectApproxEqAbs(before.tail[k], now.tail[k], 0.001);
++    }
++    try testing.expectApproxEqAbs(before.weight, now.weight, 0.001);
++    _ = glide.advance(CursorGlide.duration_s * 0.5, h);
 +    try testing.expect(glide.comet == null);
++    try testing.expectEqual(typed, glide.advance(1, h));
++    try testing.expect(glide.comet == null);
++}
++
++test "CursorGlide comet is for a block cursor only and needs cursor-morph" {
++    const testing = std.testing;
++    const h: f32 = 20;
++    const t0: std.Io.Timestamp = .now(testing.io, .awake);
++
++    // A bar and an underline glide as their rect, with no comet.
++    for ([_][4]f32{ .{ 0, 0, 2, 20 }, .{ 0, 18, 10, 2 } }) |rect| {
++        var glide: CursorGlide = .resting(.{ 0, 0 }, rect);
++        glide.retarget(.{ 0, 0 }, .{ rect[0] + 400, rect[1] + 200, rect[2], rect[3] }, t0);
++        _ = glide.advance(CursorGlide.duration_s * 0.3, h);
++        try testing.expect(glide.comet == null);
++    }
++
++    // A block has one, but not without `cursor-morph`.
++    var glide: CursorGlide = .resting(.{ 0, 0 }, .{ 0, 0, 10, 20 });
++    glide.block = true;
++    glide.retarget(.{ 0, 0 }, .{ 400, 200, 10, 20 }, t0);
++    _ = glide.advance(CursorGlide.duration_s * 0.3, null);
++    try testing.expect(glide.comet == null);
++    _ = glide.advance(CursorGlide.duration_s * 0.3, h);
++    try testing.expect(glide.comet != null);
 +}
 +
  test "CursorGlide eases out from where it is and lands exactly" {
      const testing = std.testing;
      const from: [4]f32 = .{ 0, 0, 10, 20 };
-@@ -950,6 +1198,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -950,6 +1238,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              smooth_scroll_rows: bool,
              smooth_cursor: bool,
              cursor_trail: bool,
@@ -335,7 +377,7 @@ index 859a32c9d..ad646e35b 100644
              custom_shader_animation: configpkg.CustomShaderAnimation,
  
              pub fn init(
-@@ -1030,6 +1279,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1030,6 +1319,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                      .smooth_scroll_rows = config.@"smooth-scroll-rows",
                      .smooth_cursor = config.@"smooth-cursor",
                      .cursor_trail = config.@"cursor-trail",
@@ -343,7 +385,7 @@ index 859a32c9d..ad646e35b 100644
                      .custom_shader_animation = config.@"custom-shader-animation",
                      .arena = arena,
                  };
-@@ -1817,12 +2067,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1817,12 +2107,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
          /// drawn frame, after `tickRegionAnims`.
          fn tickCursorGlide(self: *Self) void {
              self.uniforms.cursor_rect = @splat(0);
@@ -357,12 +399,12 @@ index 859a32c9d..ad646e35b 100644
 -            const rect = glide.step(.now(global.io(), .awake));
 +            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 +            const comet_cell_h: ?f32 = if (self.config.smooth_cursor and
-+                self.config.cursor_morph and glide.block) cell_h else null;
++                self.config.cursor_morph) cell_h else null;
 +            const rect = glide.step(.now(global.io(), .awake), comet_cell_h);
              const shift: f32 = shift: {
                  const col: u32 = glide.cell[0];
                  const row: u32 = glide.cell[1];
-@@ -1837,9 +2092,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1837,9 +2132,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
  
              if (self.config.smooth_cursor) {
                  self.uniforms.cursor_rect = .{ rect[0], rect[1] + shift, rect[2], rect[3] };
@@ -381,7 +423,7 @@ index 859a32c9d..ad646e35b 100644
                  if (glide.trail(cell_h)) |trail| {
                      self.uniforms.cursor_trail = .{
                          trail.from[0], trail.from[1] + shift,
-@@ -3091,11 +3354,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -3091,11 +3394,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              const old_blending = self.config.blending;
              const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders);
  
@@ -398,7 +440,7 @@ index 859a32c9d..ad646e35b 100644
              {
                  self.cursor_glide = null;
                  self.cursor_glide_shown = false;
-@@ -4643,6 +4907,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -4643,6 +4947,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  } else {
                      self.cursor_glide = .resting(cell, rect);
                  }
