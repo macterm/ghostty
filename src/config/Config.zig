@@ -1055,12 +1055,13 @@ palette: Palette = .{},
 /// This can be changed at runtime.
 @"cursor-trail": bool = false,
 
-/// With `smooth-cursor` on, let the moving cursor change its shape with its
-/// speed: it stretches along the direction it moves and gets thinner
-/// across it, and it is back to its own shape when it lands. A block
-/// cursor keeps its area. A bar or underline cursor stretches as far as a
-/// block cursor would. A move of one row or less, such as typing or a new
-/// line, does not stretch. Has no effect without `smooth-cursor`.
+/// With `smooth-cursor` on, let a moving block cursor fly as a comet: a
+/// round head where the cursor is and a body that gets thinner behind
+/// it, longer while the cursor is faster. The cursor turns into the comet
+/// as it sets out and is a block again when it lands. A move of one row
+/// or less, such as typing or a new line, has no comet. Bar, underline
+/// and hollow block cursors do not change. Has no effect without
+/// `smooth-cursor`.
 ///
 /// Downstream (thdxg/ghostty) key, read by Macterm's Animations settings.
 /// This can be changed at runtime.

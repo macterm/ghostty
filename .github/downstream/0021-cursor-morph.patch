@@ -1,17 +1,18 @@
 diff --git a/src/config/Config.zig b/src/config/Config.zig
-index e258db964..8f6e3bb98 100644
+index e258db964..50eb2fc20 100644
 --- a/src/config/Config.zig
 +++ b/src/config/Config.zig
-@@ -1055,6 +1055,17 @@ palette: Palette = .{},
+@@ -1055,6 +1055,18 @@ palette: Palette = .{},
  /// This can be changed at runtime.
  @"cursor-trail": bool = false,
  
-+/// With `smooth-cursor` on, let the moving cursor change its shape with its
-+/// speed: it stretches along the direction it moves and gets thinner
-+/// across it, and it is back to its own shape when it lands. A block
-+/// cursor keeps its area. A bar or underline cursor stretches as far as a
-+/// block cursor would. A move of one row or less, such as typing or a new
-+/// line, does not stretch. Has no effect without `smooth-cursor`.
++/// With `smooth-cursor` on, let a moving block cursor fly as a comet: a
++/// round head where the cursor is and a body that gets thinner behind
++/// it, longer while the cursor is faster. The cursor turns into the comet
++/// as it sets out and is a block again when it lands. A move of one row
++/// or less, such as typing or a new line, has no comet. Bar, underline
++/// and hollow block cursors do not change. Has no effect without
++/// `smooth-cursor`.
 +///
 +/// Downstream (thdxg/ghostty) key, read by Macterm's Animations settings.
 +/// This can be changed at runtime.
@@ -21,276 +22,312 @@ index e258db964..8f6e3bb98 100644
  /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
  /// or greater than 1 will be clamped to the nearest valid value.
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index 859a32c9d..94a2ab1da 100644
+index 859a32c9d..ad646e35b 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
-@@ -84,8 +84,12 @@ const CursorGlide = struct {
-     /// Where it set out from and when; null once it has arrived.
-     from: [4]f32,
+@@ -74,7 +74,9 @@ const log = std.log.scoped(.generic_renderer);
+ /// fills it (`Uniforms.cursor_rect` / `cursor_fill`) and, for a block
+ /// cursor, the text shader colors every glyph as cursor text by how much
+ /// of each pixel the rect covers (`cursor_glide_text`), which is what a
+-/// cursor halfway across a glyph looks like. The sprite is still added at
++/// cursor halfway across a glyph looks like. Under `cursor-morph` a block
++/// cursor is a comet while it glides (`Comet`), and both shaders fill and
++/// color by the comet's coverage in place of the rect's. The sprite is still added at
+ /// alpha 0 so the custom shader uniforms keep describing the cursor's cell.
+ const CursorGlide = struct {
+     /// The grid cell aimed at, for the region scroll shift.
+@@ -86,6 +88,13 @@ const CursorGlide = struct {
      start: ?std.Io.Timestamp,
--    /// The rect last drawn, which a retarget mid-glide sets out from.
-+    /// The rect last drawn.
+     /// The rect last drawn, which a retarget mid-glide sets out from.
      current: [4]f32,
-+    /// The rect last drawn without `cursor-morph`'s stretch, which a
-+    /// retarget mid-glide sets out from, so a stretch never builds on the
-+    /// last one. The same as `current` without `cursor-morph`.
-+    plain: [4]f32,
++    /// Whether the cursor is a block, the one shape `cursor-morph`
++    /// changes.
++    block: bool = false,
++    /// `cursor-morph`: the comet last drawn, or null, and what a retarget
++    /// mid-glide carries from it into the next glide.
++    comet: ?Comet = null,
++    carry: Comet.Carry = .{},
      /// Frames drawn since the glide began, for the log line when it lands.
      frames: u32 = 0,
      /// How far along the glide is, 0 to 1; 1 at rest.
-@@ -116,7 +120,7 @@ const CursorGlide = struct {
- 
-     /// A cursor placed with nothing to glide from: drawn at `rect` at once.
-     fn resting(cell: [2]u16, rect: [4]f32) CursorGlide {
--        return .{ .cell = cell, .to = rect, .from = rect, .start = null, .current = rect };
-+        return .{ .cell = cell, .to = rect, .from = rect, .start = null, .current = rect, .plain = rect };
-     }
- 
-     /// The streak this moment of the glide leaves, or null at rest or for
-@@ -160,7 +164,7 @@ const CursorGlide = struct {
+@@ -156,10 +165,13 @@ const CursorGlide = struct {
+     /// Aim at `rect`. The rect already aimed at changes nothing; any
+     /// other starts a glide from wherever the rect is drawn now, so a
+     /// cursor retargeted mid-glide turns toward the new place instead of
+-    /// jumping back to where the last glide began.
++    /// jumping back to where the last glide began. A comet drawn now goes
++    /// on into the new glide (`Comet.Carry`), so a held key bends the
++    /// comet instead of making it a block again at each repeat.
      fn retarget(self: *CursorGlide, cell: [2]u16, rect: [4]f32, now: std.Io.Timestamp) void {
          self.cell = cell;
          if (std.meta.eql(rect, self.to)) return;
--        self.from = self.current;
-+        self.from = self.plain;
++        self.carry = if (self.comet) |comet| comet.carry() else .{};
+         self.from = self.current;
          self.to = rect;
          self.start = now;
-         self.frames = 0;
-@@ -171,12 +175,22 @@ const CursorGlide = struct {
+@@ -171,12 +183,25 @@ const CursorGlide = struct {
          return self.start != null;
      }
  
 -    /// Advance to `now` and return the rect to draw.
 -    fn step(self: *CursorGlide, now: std.Io.Timestamp) [4]f32 {
-+    /// Advance to `now` and return the rect to draw. Under `cursor-morph`
-+    /// `morph_cell` is the cell size (width, height) and the rect is
-+    /// `morphAt`'s; otherwise it is null and the rect is `rectAt`'s.
-+    fn step(self: *CursorGlide, now: std.Io.Timestamp, morph_cell: ?[2]f32) [4]f32 {
-         const start = self.start orelse return self.to;
+-        const start = self.start orelse return self.to;
++    /// Advance to `now` and return the rect to draw. With `comet_cell_h`,
++    /// the cell height, it also sets `comet` to the shape the rect turns
++    /// into under `cursor-morph`; without it, `comet` is null.
++    fn step(self: *CursorGlide, now: std.Io.Timestamp, comet_cell_h: ?f32) [4]f32 {
++        const start = self.start orelse {
++            self.comet = null;
++            return self.to;
++        };
          const elapsed_ns: f64 = @floatFromInt(@max(start.durationTo(now).nanoseconds, 0));
 -        const elapsed_s = elapsed_ns / std.time.ns_per_s;
--        self.current = rectAt(self.from, self.to, elapsed_s);
-+        return self.advance(elapsed_ns / std.time.ns_per_s, morph_cell);
++        return self.advance(elapsed_ns / std.time.ns_per_s, comet_cell_h);
 +    }
 +
 +    /// `step` with the time since the glide began.
-+    fn advance(self: *CursorGlide, elapsed_s: f64, morph_cell: ?[2]f32) [4]f32 {
-+        self.plain = rectAt(self.from, self.to, elapsed_s);
-+        self.current = if (morph_cell) |cell|
-+            morphAt(self.from, self.to, elapsed_s, cell)
++    fn advance(self: *CursorGlide, elapsed_s: f64, comet_cell_h: ?f32) [4]f32 {
+         self.current = rectAt(self.from, self.to, elapsed_s);
++        self.comet = if (comet_cell_h) |cell_h|
++            Comet.at(self.from, self.to, elapsed_s, cell_h, self.carry)
 +        else
-+            self.plain;
++            null;
          self.progress = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
          self.frames += 1;
          if (elapsed_s >= duration_s) {
-@@ -198,8 +212,198 @@ const CursorGlide = struct {
+@@ -198,8 +223,231 @@ const CursorGlide = struct {
          for (&rect, from, to) |*out, a, b| out.* = a + (b - a) * e;
          return rect;
      }
 +
-+    /// `cursor-morph`: the most the cursor stretches along its motion, in
-+    /// cell sizes that way: a block cursor gets 2.5 times as long.
-+    pub const morph_max_stretch: f32 = 2.5;
++    /// `cursor-morph`: the shape of a block cursor while it glides, a
++    /// comet. Its round head is on the glide's rect and has the rect's
++    /// area. Its body gets thinner back to a round tail of half the
++    /// head's radius: two discs and the lines that touch both. The
++    /// tail is where the head was `lag` of the glide ago, so the comet
++    /// is long while the cursor is fast, and points the way it really
++    /// moves, also on a diagonal. The shaders fill the comet mixed with
++    /// the rect by `weight` (`Uniforms.cursor_comet`), so the block turns
++    /// into the comet as it sets out and back into the block before it
++    /// lands. A move of one row or less, such as typing or a new line,
++    /// has no comet; a move of two rows or more has the full comet.
++    pub const Comet = struct {
++        /// The centers of the head and the tail, in grid pixels.
++        head: [2]f32,
++        tail: [2]f32,
++        head_radius: f32,
++        tail_radius: f32,
++        /// 0 is the rect and 1 the comet.
++        weight: f32,
++        /// Where the tail is from the head at full weight.
++        body: [2]f32,
 +
-+    /// The rect `elapsed_s` into a glide under `cursor-morph`: the
-+    /// `rectAt` rect, made longer along the motion and thinner across it.
-+    ///
-+    /// On each axis the trailing edge eases as the glide does (cubic) and
-+    /// the leading edge eases faster (quintic). The gap between them is
-+    /// zero when the glide sets out and grows with the speed. It is almost
-+    /// zero again in the last frames before the cursor lands. Each edge
-+    /// moves only toward its target, so nothing overshoots.
-+    ///
-+    /// The gap, in cells, sets the stretch, which is limited softly to
-+    /// `morph_max_stretch`. The cursor gets as many pixels longer as a
-+    /// block cursor in its cell would, and the other side gets thinner by
-+    /// the stretch, but never thinner than a pixel. So a block keeps its
-+    /// area, and a bar or underline makes a streak of the same length as a
-+    /// block's. A move of one row or less, such as typing or a new line,
-+    /// does not stretch. The stretch grows to its full amount at a move of
-+    /// two rows.
-+    ///
-+    /// The rect stays axis-aligned, so a diagonal move stretches both
-+    /// ways and thins neither by much.
-+    fn morphAt(from: [4]f32, to: [4]f32, elapsed_s: f64, cell: [2]f32) [4]f32 {
-+        const rect = rectAt(from, to, elapsed_s);
-+        const t = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
-+        if (t <= 0 or t >= 1 or cell[0] <= 0 or cell[1] <= 0) return rect;
++        /// The fraction of the glide that the tail is behind the head.
++        pub const lag: f64 = 0.3;
++        /// The longest the body gets, head center to tail center, in
++        /// cell heights.
++        pub const max_length: f32 = 2.5;
++        /// The tail's radius over the head's.
++        pub const tail_ratio: f32 = 0.5;
++        /// The fraction of the glide in which the rect turns into the
++        /// comet, and the fraction from which it turns back.
++        pub const grow_until: f64 = 0.1;
++        pub const settle_from: f64 = 0.7;
 +
-+        const from_c = center(from);
-+        const to_c = center(to);
-+        const dx = to_c[0] - from_c[0];
-+        const dy = to_c[1] - from_c[1];
-+        const amount = std.math.clamp(@sqrt(dx * dx + dy * dy) / cell[1] - 1.0, 0.0, 1.0);
-+        if (amount == 0) return rect;
++        /// What a retarget carries into the next glide: where the tail is
++        /// from the head at full weight, and the weight. The new glide
++        /// sets out from the head, so the comet goes on with no jump.
++        pub const Carry = struct {
++            tail: [2]f32 = .{ 0, 0 },
++            weight: f32 = 0,
++        };
 +
-+        const u = 1.0 - t;
-+        const leading: f32 = @floatCast(1.0 - u * u * u * u * u);
-+        const trailing: f32 = @floatCast(1.0 - u * u * u);
-+        const room = morph_max_stretch - 1.0;
-+
-+        var mid: [2]f32 = undefined;
-+        var len: [2]f32 = undefined;
-+        var stretch: [2]f32 = .{ 1, 1 };
-+        for (0..2) |i| {
-+            const natural = rect[i + 2];
-+            mid[i] = rect[i] + natural * 0.5;
-+            len[i] = natural;
-+            const d = to_c[i] - from_c[i];
-+            if (d == 0) continue;
-+
-+            // The edges as the leading and trailing eases put them, then
-+            // moved toward the `rectAt` edges for a short move.
-+            const lo_ease, const hi_ease = if (d > 0) .{ trailing, leading } else .{ leading, trailing };
-+            const lo = from[i] + (to[i] - from[i]) * lo_ease;
-+            const hi = from[i] + from[i + 2] +
-+                (to[i] + to[i + 2] - from[i] - from[i + 2]) * hi_ease;
-+            const lo_b = rect[i] + (lo - rect[i]) * amount;
-+            const hi_b = rect[i] + natural + (hi - rect[i] - natural) * amount;
-+
-+            const extra = @max(hi_b - lo_b - natural, 0.0) / cell[i];
-+            stretch[i] = 1.0 + room * std.math.tanh(extra / room);
-+            mid[i] = (lo_b + hi_b) * 0.5;
-+            len[i] = natural + (stretch[i] - 1.0) * cell[i];
++        fn carry(self: Comet) Carry {
++            return .{ .tail = self.body, .weight = self.weight };
 +        }
 +
-+        var out: [4]f32 = undefined;
-+        for (0..2) |i| {
-+            const size = @max(len[i] / stretch[1 - i], @min(rect[i + 2], 1.0));
-+            out[i] = mid[i] - size * 0.5;
-+            out[i + 2] = size;
++        /// The comet `elapsed_s` into a glide from `from` to `to`, or null
++        /// where the cursor is its rect: at rest, as it sets out and lands,
++        /// and for a short move. `carry` is what the glide before it left.
++        fn at(from: [4]f32, to: [4]f32, elapsed_s: f64, cell_h: f32, carried: Carry) ?Comet {
++            const t = std.math.clamp(elapsed_s / duration_s, 0.0, 1.0);
++            if (t >= 1 or cell_h <= 0) return null;
++
++            const from_c = center(from);
++            const to_c = center(to);
++            const d: [2]f32 = .{ to_c[0] - from_c[0], to_c[1] - from_c[1] };
++            const amount = std.math.clamp(@sqrt(d[0] * d[0] + d[1] * d[1]) / cell_h - 1.0, 0.0, 1.0);
++            const grow: f32 = @floatCast(smoothstep(0, grow_until, t));
++            const settle: f32 = @floatCast(1.0 - smoothstep(settle_from, 1, t));
++            const weight = (carried.weight + (amount - carried.weight) * grow) * settle;
++            if (weight <= 0) return null;
++
++            // The head is on the glide's rect, the tail where the head was
++            // `lag` ago. A carried tail joins that path within `lag`. The
++            // body gets shorter with the cube of the weight, so the comet
++            // is back in its head before it turns into the block: a body
++            // mixed with the block makes a point.
++            const rect = rectAt(from, to, elapsed_s);
++            const head = center(rect);
++            const behind: f32 = @floatCast(ease(@max(t - lag, 0)));
++            const fade: f32 = @floatCast(1.0 - ease(@min(t / lag, 1)));
++            var v: [2]f32 = undefined;
++            for (&v, from_c, d, carried.tail, head) |*out, c, step_d, off, h| {
++                out.* = c + step_d * behind + off * fade - h;
++            }
++            const len = @sqrt(v[0] * v[0] + v[1] * v[1]);
++            const max_len = max_length * cell_h;
++            const scale = if (len > max_len) max_len / len else 1;
++            const body: [2]f32 = .{ v[0] * scale, v[1] * scale };
++            const shown = weight * weight * weight;
++
++            const head_radius = @sqrt(rect[2] * rect[3] / std.math.pi);
++            return .{
++                .head = head,
++                .tail = .{ head[0] + body[0] * shown, head[1] + body[1] * shown },
++                .head_radius = head_radius,
++                .tail_radius = head_radius * tail_ratio,
++                .weight = weight,
++                .body = body,
++            };
 +        }
-+        return out;
-+    }
++
++        fn smoothstep(edge0: f64, edge1: f64, x: f64) f64 {
++            const s = std.math.clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
++            return s * s * (3.0 - 2.0 * s);
++        }
++    };
  };
  
-+test "CursorGlide morph stretches a long move along its motion and lands exactly" {
++test "CursorGlide comet flies a long move head first and lands as the block" {
 +    const testing = std.testing;
-+    const cell: [2]f32 = .{ 10, 20 };
++    const h: f32 = 20;
 +    const from: [4]f32 = .{ 0, 0, 10, 20 };
-+    const to: [4]f32 = .{ 200, 0, 10, 20 };
++    const to: [4]f32 = .{ 400, 0, 10, 20 };
 +    const d = CursorGlide.duration_s;
 +
-+    // It sets out from and lands on the cells exactly.
-+    try testing.expectEqual(from, CursorGlide.morphAt(from, to, 0, cell));
-+    try testing.expectEqual(to, CursorGlide.morphAt(from, to, d, cell));
-+    try testing.expectEqual(to, CursorGlide.morphAt(from, to, 10, cell));
++    // It sets out as the block and lands as the block.
++    try testing.expect(CursorGlide.Comet.at(from, to, 0, h, .{}) == null);
++    try testing.expect(CursorGlide.Comet.at(from, to, d, h, .{}) == null);
++    try testing.expect(CursorGlide.Comet.at(from, to, 10, h, .{}) == null);
 +
-+    // On the way it is longer, thinner, of the same area, centered on
-+    // the row, no longer than the limit, and inside the path.
-+    var steps: usize = 1;
-+    var peak: f32 = 0;
-+    while (steps < 20) : (steps += 1) {
-+        const t = d * @as(f64, @floatFromInt(steps)) / 20.0;
-+        const r = CursorGlide.morphAt(from, to, t, cell);
-+        try testing.expect(r[2] > 10);
-+        try testing.expect(r[2] <= 10 * CursorGlide.morph_max_stretch + 0.001);
-+        try testing.expect(r[3] < 20);
-+        try testing.expectApproxEqAbs(@as(f32, 200), r[2] * r[3], 0.01);
-+        try testing.expectApproxEqAbs(@as(f32, 10), r[1] + r[3] / 2, 0.001);
-+        try testing.expect(r[0] >= 0 and r[0] + r[2] <= 210);
-+        peak = @max(peak, r[2]);
++    // On the way the head is on the glide's rect, with the block's
++    // area, and the tail is behind it on the row, smaller, never past
++    // the start and never more than the longest body. As the comet turns
++    // back into the block, its body gets shorter.
++    var longest: f32 = 0;
++    var i: usize = 1;
++    while (i < 20) : (i += 1) {
++        const t = d * @as(f64, @floatFromInt(i)) / 20.0;
++        const c = CursorGlide.Comet.at(from, to, t, h, .{}).?;
++        const rect = CursorGlide.rectAt(from, to, t);
++        try testing.expectApproxEqAbs(rect[0] + 5, c.head[0], 0.001);
++        try testing.expectEqual(@as(f32, 10), c.head[1]);
++        try testing.expectEqual(@as(f32, 10), c.tail[1]);
++        try testing.expectApproxEqAbs(@as(f32, 200), std.math.pi * c.head_radius * c.head_radius, 0.01);
++        try testing.expectApproxEqAbs(c.head_radius / 2, c.tail_radius, 0.001);
++        try testing.expect(c.tail[0] <= c.head[0] and c.tail[0] >= 5);
++        try testing.expect(c.head[0] - c.tail[0] <= CursorGlide.Comet.max_length * h + 0.001);
++        try testing.expect(c.weight > 0 and c.weight <= 1);
++        longest = @max(longest, c.head[0] - c.tail[0]);
 +    }
-+    // The stretch comes back down as it lands.
-+    const late = CursorGlide.morphAt(from, to, d * 0.95, cell);
-+    try testing.expect(late[2] < peak);
-+    try testing.expect(late[2] < 11);
++    try testing.expectApproxEqAbs(CursorGlide.Comet.max_length * h, longest, 0.001);
++
++    // Full from a tenth of the glide to seven tenths, then it goes back.
++    try testing.expectApproxEqAbs(@as(f32, 1), CursorGlide.Comet.at(from, to, d * 0.1, h, .{}).?.weight, 0.0001);
++    try testing.expectApproxEqAbs(@as(f32, 1), CursorGlide.Comet.at(from, to, d * 0.7, h, .{}).?.weight, 0.0001);
++    const late = CursorGlide.Comet.at(from, to, d * 0.95, h, .{}).?;
++    try testing.expect(late.weight < 0.1);
++    try testing.expect(late.head[0] - late.tail[0] < 0.1 * CursorGlide.Comet.max_length * h);
 +
 +    // Moving the other way is the mirror image.
-+    const ahead = CursorGlide.morphAt(from, to, d * 0.3, cell);
-+    const back = CursorGlide.morphAt(to, from, d * 0.3, cell);
-+    try testing.expectApproxEqAbs(ahead[2], back[2], 0.001);
-+    try testing.expectApproxEqAbs(ahead[3], back[3], 0.001);
-+    try testing.expectApproxEqAbs(ahead[0] + ahead[2], 210 - back[0], 0.001);
++    const ahead = CursorGlide.Comet.at(from, to, d * 0.3, h, .{}).?;
++    const back = CursorGlide.Comet.at(to, from, d * 0.3, h, .{}).?;
++    try testing.expectApproxEqAbs(ahead.head[0] - ahead.tail[0], back.tail[0] - back.head[0], 0.001);
 +}
 +
-+test "CursorGlide morph follows the speed and leaves typing alone" {
++test "CursorGlide comet is long enough to see and points the way it moves" {
 +    const testing = std.testing;
-+    const cell: [2]f32 = .{ 10, 20 };
++    const h: f32 = 20;
 +    const from: [4]f32 = .{ 0, 0, 10, 20 };
 +    const d = CursorGlide.duration_s;
 +
-+    // Typing, two columns and a new line: the rect of the plain glide.
-+    for ([_][4]f32{ .{ 10, 0, 10, 20 }, .{ 20, 0, 10, 20 }, .{ 0, 20, 10, 20 } }) |to| {
-+        var steps: usize = 0;
-+        while (steps <= 10) : (steps += 1) {
-+            const t = d * @as(f64, @floatFromInt(steps)) / 10.0;
-+            try testing.expectEqual(CursorGlide.rectAt(from, to, t), CursorGlide.morphAt(from, to, t, cell));
++    // A jump of three rows: at a 60 fps frame a third of the way in,
++    // the body is more than a row and a half.
++    const rows3 = CursorGlide.Comet.at(from, .{ 0, 60, 10, 20 }, d * 0.3, h, .{}).?;
++    try testing.expect(rows3.head[1] - rows3.tail[1] > 1.5 * h);
++    try testing.expectEqual(rows3.head[0], rows3.tail[0]);
++
++    // A long diagonal jump (27 rows, 95 columns) is a comet along the
++    // diagonal, at its longest for most of the glide.
++    const to: [4]f32 = .{ 950, 540, 10, 20 };
++    var i: usize = 1;
++    while (i <= 5) : (i += 1) {
++        const t = d * @as(f64, @floatFromInt(i)) / 8.0;
++        const c = CursorGlide.Comet.at(from, to, t, h, .{}).?;
++        const vx = c.head[0] - c.tail[0];
++        const vy = c.head[1] - c.tail[1];
++        try testing.expectApproxEqAbs(CursorGlide.Comet.max_length * h, @sqrt(vx * vx + vy * vy), 0.001);
++        try testing.expectApproxEqAbs(@as(f32, 950.0 / 540.0), vx / vy, 0.001);
++    }
++
++    // Typing, two columns and a new line: no comet at all.
++    for ([_][4]f32{ .{ 10, 0, 10, 20 }, .{ 20, 0, 10, 20 }, .{ 0, 20, 10, 20 } }) |near| {
++        i = 0;
++        while (i <= 10) : (i += 1) {
++            const t = d * @as(f64, @floatFromInt(i)) / 10.0;
++            try testing.expect(CursorGlide.Comet.at(from, near, t, h, .{}) == null);
 +        }
 +    }
 +
-+    // A faster move (farther in the same time) stretches more, up to the
-+    // limit.
-+    const t = d * 0.3;
-+    const short = CursorGlide.morphAt(from, .{ 40, 0, 10, 20 }, t, cell);
-+    const medium = CursorGlide.morphAt(from, .{ 80, 0, 10, 20 }, t, cell);
-+    const long = CursorGlide.morphAt(from, .{ 2000, 0, 10, 20 }, t, cell);
-+    try testing.expect(short[2] > 10 and short[2] < medium[2] and medium[2] < long[2]);
-+    try testing.expect(long[2] <= 10 * CursorGlide.morph_max_stretch + 0.001);
-+
-+    // A vertical move stretches the height and thins the width.
-+    const down = CursorGlide.morphAt(from, .{ 0, 400, 10, 20 }, t, cell);
-+    try testing.expect(down[3] > 20 and down[2] < 10);
-+    try testing.expectApproxEqAbs(@as(f32, 5), down[0] + down[2] / 2, 0.001);
++    // A move of one and a half rows has half the weight.
++    const half = CursorGlide.Comet.at(from, .{ 0, 30, 10, 20 }, d * 0.5, h, .{}).?;
++    try testing.expectApproxEqAbs(@as(f32, 0.5), half.weight, 0.001);
 +}
 +
-+test "CursorGlide morph stretches a bar and an underline as far as a block" {
++test "CursorGlide comet goes on through a retarget with no jump" {
 +    const testing = std.testing;
-+    const cell: [2]f32 = .{ 10, 20 };
-+    const t = CursorGlide.duration_s * 0.3;
-+    const block = CursorGlide.morphAt(.{ 0, 0, 10, 20 }, .{ 2000, 0, 10, 20 }, t, cell);
-+    const block_down = CursorGlide.morphAt(.{ 0, 0, 10, 20 }, .{ 0, 2000, 10, 20 }, t, cell);
-+
-+    // A bar across a row gets as many pixels longer as the block, and
-+    // as much thinner; down a column it gets as long and keeps a pixel.
-+    const bar = CursorGlide.morphAt(.{ 0, 0, 2, 20 }, .{ 2000, 0, 2, 20 }, t, cell);
-+    try testing.expectApproxEqAbs(block[2] - 10, bar[2] - 2, 0.001);
-+    try testing.expectApproxEqAbs(block[3], bar[3], 0.001);
-+    const bar_down = CursorGlide.morphAt(.{ 0, 0, 2, 20 }, .{ 0, 2000, 2, 20 }, t, cell);
-+    try testing.expectApproxEqAbs(block_down[3], bar_down[3], 0.001);
-+    try testing.expectEqual(@as(f32, 1), bar_down[2]);
-+
-+    // An underline down a column likewise.
-+    const under = CursorGlide.morphAt(.{ 0, 18, 10, 2 }, .{ 0, 2018, 10, 2 }, t, cell);
-+    try testing.expectApproxEqAbs(block_down[3] - 20, under[3] - 2, 0.001);
-+    try testing.expectApproxEqAbs(block_down[2], under[2], 0.001);
-+}
-+
-+test "CursorGlide morph does not build on itself when a glide is retargeted" {
-+    const testing = std.testing;
-+    const cell: [2]f32 = .{ 10, 20 };
++    const h: f32 = 20;
 +    const t0: std.Io.Timestamp = .now(testing.io, .awake);
 +
 +    // A held key: a new target every 33 ms, each one 100 px on.
 +    var glide: CursorGlide = .resting(.{ 0, 0 }, .{ 0, 0, 10, 20 });
 +    var x: f32 = 0;
++    var last: ?CursorGlide.Comet = null;
 +    var repeats: usize = 0;
 +    while (repeats < 20) : (repeats += 1) {
 +        x += 100;
 +        glide.retarget(.{ 0, 0 }, .{ x, 0, 10, 20 }, t0);
-+        const r = glide.advance(0.033, cell);
-+        try testing.expect(r[2] <= 10 * CursorGlide.morph_max_stretch + 0.001);
-+        try testing.expectApproxEqAbs(@as(f32, 200), r[2] * r[3], 0.01);
-+        try testing.expectEqual(CursorGlide.rectAt(glide.from, glide.to, 0.033), glide.plain);
++        // The first frame of the new glide is the last frame of the old.
++        if (last) |before| {
++            _ = glide.advance(0, h);
++            const now = glide.comet.?;
++            for (0..2) |k| {
++                try testing.expectApproxEqAbs(before.head[k], now.head[k], 0.001);
++                try testing.expectApproxEqAbs(before.tail[k], now.tail[k], 0.001);
++            }
++            try testing.expectApproxEqAbs(before.weight, now.weight, 0.001);
++        }
++        _ = glide.advance(0.033, h);
++        last = glide.comet.?;
++        try testing.expect(last.?.head[0] - last.?.tail[0] <= CursorGlide.Comet.max_length * h + 0.001);
 +    }
 +
-+    // It lands on the last target in its own shape.
-+    try testing.expectEqual([4]f32{ x, 0, 10, 20 }, glide.advance(1, cell));
++    // It lands on the last target as the block.
++    try testing.expectEqual([4]f32{ x, 0, 10, 20 }, glide.advance(1, h));
++    try testing.expect(glide.comet == null);
 +    try testing.expect(!glide.inFlight());
++
++    // Without `cursor-morph` there is no comet.
++    glide.retarget(.{ 0, 0 }, .{ 0, 0, 10, 20 }, t0);
++    _ = glide.advance(0.05, null);
++    try testing.expect(glide.comet == null);
 +}
 +
  test "CursorGlide eases out from where it is and lands exactly" {
      const testing = std.testing;
      const from: [4]f32 = .{ 0, 0, 10, 20 };
-@@ -227,6 +431,7 @@ test "CursorGlide eases out from where it is and lands exactly" {
-     try testing.expect(glide.inFlight());
-     try testing.expectEqual(from, glide.from);
-     glide.current = mid;
-+    glide.plain = mid;
-     glide.retarget(.{ 0, 0 }, from, t0);
-     try testing.expectEqual(mid, glide.from);
-     try testing.expectEqual(from, glide.to);
-@@ -950,6 +1155,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -950,6 +1198,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              smooth_scroll_rows: bool,
              smooth_cursor: bool,
              cursor_trail: bool,
@@ -298,7 +335,7 @@ index 859a32c9d..94a2ab1da 100644
              custom_shader_animation: configpkg.CustomShaderAnimation,
  
              pub fn init(
-@@ -1030,6 +1236,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1030,6 +1279,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                      .smooth_scroll_rows = config.@"smooth-scroll-rows",
                      .smooth_cursor = config.@"smooth-cursor",
                      .cursor_trail = config.@"cursor-trail",
@@ -306,30 +343,45 @@ index 859a32c9d..94a2ab1da 100644
                      .custom_shader_animation = config.@"custom-shader-animation",
                      .arena = arena,
                  };
-@@ -1822,7 +2029,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1817,12 +2067,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         /// drawn frame, after `tickRegionAnims`.
+         fn tickCursorGlide(self: *Self) void {
+             self.uniforms.cursor_rect = @splat(0);
++            self.uniforms.cursor_comet = @splat(0);
++            self.uniforms.cursor_comet_size = @splat(0);
+             self.uniforms.cursor_trail = @splat(0);
+             self.uniforms.cursor_trail_size = @splat(0);
              if (!self.cursor_glide_shown) return;
              const glide: *CursorGlide = if (self.cursor_glide) |*g| g else return;
  
 -            const rect = glide.step(.now(global.io(), .awake));
-+            const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
 +            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-+            const morph: ?[2]f32 = if (self.config.smooth_cursor and self.config.cursor_morph)
-+                .{ cell_w, cell_h }
-+            else
-+                null;
-+            const rect = glide.step(.now(global.io(), .awake), morph);
++            const comet_cell_h: ?f32 = if (self.config.smooth_cursor and
++                self.config.cursor_morph and glide.block) cell_h else null;
++            const rect = glide.step(.now(global.io(), .awake), comet_cell_h);
              const shift: f32 = shift: {
                  const col: u32 = glide.cell[0];
                  const row: u32 = glide.cell[1];
-@@ -1839,7 +2052,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -1837,9 +2092,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+ 
+             if (self.config.smooth_cursor) {
                  self.uniforms.cursor_rect = .{ rect[0], rect[1] + shift, rect[2], rect[3] };
++                if (glide.comet) |comet| {
++                    self.uniforms.cursor_comet = .{
++                        comet.head[0], comet.head[1] + shift,
++                        comet.tail[0], comet.tail[1] + shift,
++                    };
++                    self.uniforms.cursor_comet_size = .{
++                        comet.head_radius, comet.tail_radius, comet.weight, 0,
++                    };
++                }
              }
              if (self.config.cursor_trail) {
 -                const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                  if (glide.trail(cell_h)) |trail| {
                      self.uniforms.cursor_trail = .{
                          trail.from[0], trail.from[1] + shift,
-@@ -3091,11 +3303,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -3091,11 +3354,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              const old_blending = self.config.blending;
              const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders);
  
@@ -346,3 +398,166 @@ index 859a32c9d..94a2ab1da 100644
              {
                  self.cursor_glide = null;
                  self.cursor_glide_shown = false;
+@@ -4643,6 +4907,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 } else {
+                     self.cursor_glide = .resting(cell, rect);
+                 }
++                self.cursor_glide.?.block = cursor_style == .block;
+                 self.cursor_glide_shown = true;
+                 self.uniforms.cursor_fill = .{
+                     cursor_color.r,
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 382b0f3b3..2af7605dd 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -295,6 +295,14 @@ pub const Uniforms = extern struct {
+     cursor_rect: [4]f32 align(16) = @splat(0),
+     cursor_fill: [4]u8 align(4) = @splat(0),
+ 
++    /// `cursor-morph` (`CursorGlide.Comet` in the renderer): the comet a
++    /// gliding block cursor is, as the centers of its head and tail in
++    /// grid pixels (head.xy, tail.xy), and their radii (.xy) and how far
++    /// the shape is from `cursor_rect` (0) to the comet (1) (.z). The
++    /// shaders fill and color by the comet's coverage where .z is above 0.
++    cursor_comet: [4]f32 align(16) = @splat(0),
++    cursor_comet_size: [4]f32 align(16) = @splat(0),
++
+     /// Cursor trail (`CursorGlide.Trail`): the streak's segment, as the
+     /// centers it is swept between in grid pixels (from.xy, to.xy), and
+     /// its half size (.xy) and opacity (.z); opacity 0 while there is none.
+diff --git a/src/renderer/opengl/shaders.zig b/src/renderer/opengl/shaders.zig
+index 3a9516047..f2bc3be49 100644
+--- a/src/renderer/opengl/shaders.zig
++++ b/src/renderer/opengl/shaders.zig
+@@ -224,6 +224,10 @@ pub const Uniforms = extern struct {
+     cursor_rect: [4]f32 align(16) = @splat(0),
+     cursor_fill: [4]u8 align(4) = @splat(0),
+ 
++    /// Cursor morph; see the Metal `Uniforms`.
++    cursor_comet: [4]f32 align(16) = @splat(0),
++    cursor_comet_size: [4]f32 align(16) = @splat(0),
++
+     /// Cursor trail; see the Metal `Uniforms`.
+     cursor_trail: [4]f32 align(16) = @splat(0),
+     cursor_trail_size: [4]f32 align(16) = @splat(0),
+diff --git a/src/renderer/shaders/glsl/common.glsl b/src/renderer/shaders/glsl/common.glsl
+index 5f4439a7d..67be47b0f 100644
+--- a/src/renderer/shaders/glsl/common.glsl
++++ b/src/renderer/shaders/glsl/common.glsl
+@@ -44,6 +44,12 @@ layout(binding = 1, std140) uniform Globals {
+     // background shader; all zero while no cursor is drawn this way.
+     uniform vec4 cursor_rect;
+     uniform uint cursor_fill_packed_4u8;
++    // Cursor morph: the comet a gliding block cursor is, as the centers
++    // of its head and tail in grid pixels (head.xy, tail.xy), and their
++    // radii (.xy) and how far the shape is from cursor_rect (0) to the
++    // comet (1) (.z); .z is 0 while there is no comet.
++    uniform vec4 cursor_comet;
++    uniform vec4 cursor_comet_size;
+     // Cursor trail: the streak's segment as the centers it is swept
+     // between in grid pixels (from.xy, to.xy), and its half size (.xy)
+     // and opacity (.z); opacity 0 while there is none.
+@@ -67,13 +73,41 @@ float trail_coverage(vec2 p) {
+     return (1.0 - smoothstep(0.0, 1.0, dist)) * s.z;
+ }
+ 
++// Cursor morph: the signed distance from p to the comet, a disc of
++// radius r1 at a, a smaller disc of radius r2 at b, and the two lines
++// that touch both discs.
++float comet_distance(vec2 p, vec2 a, vec2 b, float r1, float r2) {
++    float h = length(b - a);
++    if (h <= r1 - r2) return length(p - a) - r1;
++    vec2 axis = (b - a) / h;
++    vec2 q = vec2(abs(dot(p - a, vec2(-axis.y, axis.x))), dot(p - a, axis));
++    float s = (r1 - r2) / h;
++    float c = sqrt(1.0 - s * s);
++    float k = dot(q, vec2(-s, c));
++    if (k < 0.0) return length(q) - r1;
++    if (k > c * h) return length(q - vec2(0.0, h)) - r2;
++    return dot(q, vec2(c, s)) - r1;
++}
++
++// The signed distance from p to the rect r (left, top, width, height).
++float rect_distance(vec2 p, vec4 r) {
++    vec2 d = abs(p - (r.xy + r.zw * 0.5)) - r.zw * 0.5;
++    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
++}
++
+ // Smooth cursor: how much of the 1x1 pixel centered on grid pixel p lies
+ // inside cursor_rect. Exact box coverage, so a resting cursor on whole
+ // pixels is as hard-edged as the sprite it replaces and only an edge in
+-// motion blends.
++// motion blends. Under cursor morph, the rect mixed with the comet by
++// their distances, with a one-pixel antialiased edge.
+ float cursor_coverage(vec2 p) {
+     vec4 r = cursor_rect;
+     if (r.z <= 0.0 || r.w <= 0.0) return 0.0;
++    vec4 s = cursor_comet_size;
++    if (s.z > 0.0) {
++        float d = mix(rect_distance(p, r), comet_distance(p, cursor_comet.xy, cursor_comet.zw, s.x, s.y), s.z);
++        return clamp(0.5 - d, 0.0, 1.0);
++    }
+     vec2 lo = r.xy;
+     vec2 hi = r.xy + r.zw;
+     vec2 c = clamp(min(hi, p + 0.5) - max(lo, p - 0.5), 0.0, 1.0);
+diff --git a/src/renderer/shaders/shaders.metal b/src/renderer/shaders/shaders.metal
+index cdd1bac60..e443de763 100644
+--- a/src/renderer/shaders/shaders.metal
++++ b/src/renderer/shaders/shaders.metal
+@@ -49,6 +49,12 @@ struct Uniforms {
+   // shader; all zero while no cursor is drawn this way.
+   float4 cursor_rect;
+   uchar4 cursor_fill;
++  // Cursor morph: the comet a gliding block cursor is, as the centers of
++  // its head and tail in grid pixels (head.xy, tail.xy), and their radii
++  // (.xy) and how far the shape is from cursor_rect (0) to the comet (1)
++  // (.z); .z is 0 while there is no comet.
++  float4 cursor_comet;
++  float4 cursor_comet_size;
+   // Cursor trail: the streak's segment as the centers it is swept between
+   // in grid pixels (from.xy, to.xy), and its half size (.xy) and opacity
+   // (.z); opacity 0 while there is none. Drawn in cursor_fill's color.
+@@ -72,13 +78,42 @@ float trail_coverage(constant Uniforms& uniforms, float2 p) {
+   return (1.0 - smoothstep(0.0, 1.0, dist)) * s.z;
+ }
+ 
++// Cursor morph: the signed distance from p to the comet, a disc of
++// radius r1 at a, a smaller disc of radius r2 at b, and the two lines that
++// touch both discs.
++float comet_distance(float2 p, float2 a, float2 b, float r1, float r2) {
++  float h = length(b - a);
++  if (h <= r1 - r2) return length(p - a) - r1;
++  float2 axis = (b - a) / h;
++  float2 q = float2(abs(dot(p - a, float2(-axis.y, axis.x))), dot(p - a, axis));
++  float s = (r1 - r2) / h;
++  float c = sqrt(1.0 - s * s);
++  float k = dot(q, float2(-s, c));
++  if (k < 0.0) return length(q) - r1;
++  if (k > c * h) return length(q - float2(0.0, h)) - r2;
++  return dot(q, float2(c, s)) - r1;
++}
++
++// The signed distance from p to the rect r (left, top, width, height).
++float rect_distance(float2 p, float4 r) {
++  float2 d = abs(p - (r.xy + r.zw * 0.5)) - r.zw * 0.5;
++  return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
++}
++
+ // Smooth cursor: how much of the 1x1 pixel centered on grid pixel p lies
+ // inside cursor_rect. Exact box coverage, so a resting cursor on whole
+ // pixels is as hard-edged as the sprite it replaces and only an edge in
+-// motion blends.
++// motion blends. Under cursor morph, the rect mixed with the comet by
++// their distances, with a one-pixel antialiased edge.
+ float cursor_coverage(constant Uniforms& uniforms, float2 p) {
+   float4 r = uniforms.cursor_rect;
+   if (r.z <= 0.0 || r.w <= 0.0) return 0.0;
++  float4 s = uniforms.cursor_comet_size;
++  if (s.z > 0.0) {
++    float4 c = uniforms.cursor_comet;
++    float d = mix(rect_distance(p, r), comet_distance(p, c.xy, c.zw, s.x, s.y), s.z);
++    return clamp(0.5 - d, 0.0, 1.0);
++  }
+   float2 lo = r.xy;
+   float2 hi = r.xy + r.zw;
+   float2 c = clamp(min(hi, p + 0.5) - max(lo, p - 0.5), 0.0, 1.0);
