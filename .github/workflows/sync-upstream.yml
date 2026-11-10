@@ -67,10 +67,25 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # The sync force-pushes main, and the fork-owned files include
+      # workflows, so the push needs contents and workflows write. The job
+      # token cannot push workflow files. This is a token of the org's
+      # macterm-ci GitHub App, for this repository only. A push with it starts
+      # the workflows of the new commit, as a push with a PAT did.
+      - name: App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.MACTERM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MACTERM_APP_PRIVATE_KEY }}
+          repositories: ghostty
+          permission-contents: write
+          permission-workflows: write
+
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Squash-sync onto upstream
         run: |
