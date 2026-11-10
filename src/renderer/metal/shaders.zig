@@ -295,6 +295,14 @@ pub const Uniforms = extern struct {
     cursor_rect: [4]f32 align(16) = @splat(0),
     cursor_fill: [4]u8 align(4) = @splat(0),
 
+    /// `cursor-morph` (`CursorGlide.Comet` in the renderer): the comet a
+    /// gliding block cursor is, as the centers of its head and tail in
+    /// grid pixels (head.xy, tail.xy), and their radii (.xy) and how far
+    /// the shape is from `cursor_rect` (0) to the comet (1) (.z). The
+    /// shaders fill and color by the comet's coverage where .z is above 0.
+    cursor_comet: [4]f32 align(16) = @splat(0),
+    cursor_comet_size: [4]f32 align(16) = @splat(0),
+
     /// Cursor trail (`CursorGlide.Trail`): the streak's segment, as the
     /// centers it is swept between in grid pixels (from.xy, to.xy), and
     /// its half size (.xy) and opacity (.z); opacity 0 while there is none.

@@ -49,6 +49,12 @@ struct Uniforms {
   // shader; all zero while no cursor is drawn this way.
   float4 cursor_rect;
   uchar4 cursor_fill;
+  // Cursor morph: the comet a gliding block cursor is, as the centers of
+  // its head and tail in grid pixels (head.xy, tail.xy), and their radii
+  // (.xy) and how far the shape is from cursor_rect (0) to the comet (1)
+  // (.z); .z is 0 while there is no comet.
+  float4 cursor_comet;
+  float4 cursor_comet_size;
   // Cursor trail: the streak's segment as the centers it is swept between
   // in grid pixels (from.xy, to.xy), and its half size (.xy) and opacity
   // (.z); opacity 0 while there is none. Drawn in cursor_fill's color.
@@ -72,13 +78,42 @@ float trail_coverage(constant Uniforms& uniforms, float2 p) {
   return (1.0 - smoothstep(0.0, 1.0, dist)) * s.z;
 }
 
+// Cursor morph: the signed distance from p to the comet, a disc of
+// radius r1 at a, a smaller disc of radius r2 at b, and the two lines that
+// touch both discs.
+float comet_distance(float2 p, float2 a, float2 b, float r1, float r2) {
+  float h = length(b - a);
+  if (h <= r1 - r2) return length(p - a) - r1;
+  float2 axis = (b - a) / h;
+  float2 q = float2(abs(dot(p - a, float2(-axis.y, axis.x))), dot(p - a, axis));
+  float s = (r1 - r2) / h;
+  float c = sqrt(1.0 - s * s);
+  float k = dot(q, float2(-s, c));
+  if (k < 0.0) return length(q) - r1;
+  if (k > c * h) return length(q - float2(0.0, h)) - r2;
+  return dot(q, float2(c, s)) - r1;
+}
+
+// The signed distance from p to the rect r (left, top, width, height).
+float rect_distance(float2 p, float4 r) {
+  float2 d = abs(p - (r.xy + r.zw * 0.5)) - r.zw * 0.5;
+  return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+}
+
 // Smooth cursor: how much of the 1x1 pixel centered on grid pixel p lies
 // inside cursor_rect. Exact box coverage, so a resting cursor on whole
 // pixels is as hard-edged as the sprite it replaces and only an edge in
-// motion blends.
+// motion blends. Under cursor morph, the rect mixed with the comet by
+// their distances, with a one-pixel antialiased edge.
 float cursor_coverage(constant Uniforms& uniforms, float2 p) {
   float4 r = uniforms.cursor_rect;
   if (r.z <= 0.0 || r.w <= 0.0) return 0.0;
+  float4 s = uniforms.cursor_comet_size;
+  if (s.z > 0.0) {
+    float4 c = uniforms.cursor_comet;
+    float d = mix(rect_distance(p, r), comet_distance(p, c.xy, c.zw, s.x, s.y), s.z);
+    return clamp(0.5 - d, 0.0, 1.0);
+  }
   float2 lo = r.xy;
   float2 hi = r.xy + r.zw;
   float2 c = clamp(min(hi, p + 0.5) - max(lo, p - 0.5), 0.0, 1.0);
