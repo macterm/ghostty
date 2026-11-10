@@ -128,14 +128,24 @@ jobs:
         run: |
           tar czf ghostty-resources.tar.gz -C zig-out/share ghostty terminfo
 
-      # GH_PAT, not GITHUB_TOKEN: since GitHub paused and re-enabled the
-      # workflows of this fork (2026-10-19), the job token is read-only
-      # whatever `permissions:` says — `gh release create` got HTTP 403
-      # "Resource not accessible by integration" twice. The sync already
-      # pushes with the same PAT.
+      # Not GITHUB_TOKEN: since GitHub paused and re-enabled the workflows of
+      # this fork (2026-10-19), the job token is read-only whatever
+      # `permissions:` says — `gh release create` got HTTP 403 "Resource not
+      # accessible by integration" twice. This is a token of the org's
+      # macterm-ci GitHub App, for this repository only, with contents write.
+      # It expires after an hour. The sync uses the same app.
+      - name: App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.MACTERM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MACTERM_APP_PRIVATE_KEY }}
+          repositories: ghostty
+          permission-contents: write
+
       - name: Create release
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.tag.outputs.tag }}
           DATE: ${{ needs.tag.outputs.date }}
         run: |
