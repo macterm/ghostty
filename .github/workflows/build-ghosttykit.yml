@@ -26,13 +26,13 @@ jobs:
   # build-<today> tag was deleted and re-cut by a second build the same day,
   # silently changing what Macterm's pin pointed at.
   tag:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       date: ${{ steps.tag.outputs.date }}
       exists: ${{ steps.tag.outputs.exists }}
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v7
 
       - name: Resolve tag
         id: tag
@@ -57,7 +57,7 @@ jobs:
   build:
     needs: tag
     if: needs.tag.outputs.exists == 'false'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     timeout-minutes: 60
     permissions:
       contents: write

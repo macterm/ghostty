@@ -82,9 +82,9 @@ jobs:
     # The freshness half would fail an unrelated PR whenever the sync is
     # behind, so this job keeps to its schedule.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -181,9 +181,9 @@ jobs:
 
   reproducible:
     if: github.event_name != 'schedule'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
