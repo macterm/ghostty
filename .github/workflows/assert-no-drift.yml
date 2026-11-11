@@ -73,6 +73,7 @@ env:
     .github/downstream/0019-command-text.patch
     .github/downstream/0020-unknown-apc.patch
     .github/downstream/0021-cursor-morph.patch
+    .github/downstream/0022-manual-io.patch
   # How far behind upstream HEAD the fork's base may fall before the sync is
   # presumed broken. A daily sync should keep this at 0–1 days.
   MAX_AGE_DAYS: "4"
