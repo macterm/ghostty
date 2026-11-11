@@ -1,0 +1,616 @@
+From 6537dd5791de388faf7b3a06e320e7a0733bd992 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Wed, 11 Nov 2026 01:14:51 -0500
+Subject: [PATCH] embedded: add a manual surface that the host feeds with
+ bytes, with no pty
+
+A surface made with manual_io has no pty and no child process. The host
+feeds the terminal with ghostty_surface_feed. Input and terminal replies
+go out through manual_write. Each size change goes out through
+manual_resize. Selection, search, scrollback, links, OSC handling and
+every GHOSTTY_ACTION callback work as for a pty surface, because they
+read the terminal and not the pty.
+
+Add the manual termio backend (termio/Manual.zig), the three fields of
+ghostty_surface_config_s, and ghostty_surface_feed. A normal surface
+is unchanged.
+---
+ include/ghostty.h      |  19 ++++
+ src/Surface.zig        |  84 +++++++++-------
+ src/apprt/embedded.zig |  47 +++++++++
+ src/termio.zig         |   1 +
+ src/termio/Manual.zig  | 217 +++++++++++++++++++++++++++++++++++++++++
+ src/termio/backend.zig |  19 +++-
+ 6 files changed, 351 insertions(+), 36 deletions(-)
+ create mode 100644 src/termio/Manual.zig
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index da573d97f..b1b740168 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -521,6 +521,19 @@ typedef enum {
+   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
+ } ghostty_surface_context_e;
+ 
++// Manual surface callbacks, called on a libghostty IO thread. The data pointer
++// is valid only during the call. Either callback can run with the renderer
++// lock held, so neither may call ghostty_surface_feed or another function that
++// reads the terminal, or take a lock that a thread holds while it feeds.
++typedef void (*ghostty_surface_manual_write_cb)(void* GHOSTTY_NULLABLE,
++                                                const uint8_t*,
++                                                size_t);
++typedef void (*ghostty_surface_manual_resize_cb)(void* GHOSTTY_NULLABLE,
++                                                 uint16_t,
++                                                 uint16_t,
++                                                 uint32_t,
++                                                 uint32_t);
++
+ typedef struct {
+   ghostty_platform_e platform_tag;
+   ghostty_platform_u platform;
+@@ -539,6 +552,9 @@ typedef struct {
+   bool disable_shell_integration;
+   uint32_t initial_width_px;
+   uint32_t initial_height_px;
++  bool manual_io;
++  ghostty_surface_manual_write_cb GHOSTTY_NULLABLE manual_write;
++  ghostty_surface_manual_resize_cb GHOSTTY_NULLABLE manual_resize;
+ } ghostty_surface_config_s;
+ 
+ typedef struct {
+@@ -1238,6 +1254,9 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
++GHOSTTY_API void ghostty_surface_feed(ghostty_surface_t,
++                                      const uint8_t*,
++                                      uintptr_t);
+ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+ GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+ GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 7215ffbfd..3e055ad0c 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -669,44 +669,56 @@ pub fn init(
+     // This separate block ({}) is important because our errdefers must
+     // be scoped here to be valid.
+     {
+-        // Exec.init takes ownership of the env even if it fails, so the
+-        // errdefer for it must not reach past the call.
+-        const env = termio_env: {
+-            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+-                // If an error occurs, we don't want to block surface startup.
+-                log.warn("error getting env map for surface err={}", .{err});
+-                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+-            };
+-            errdefer env.deinit();
++        // A manual surface (the embedder feeds bytes and takes the writes
++        // through callbacks) has no subprocess: no env, no command, no pty.
++        const manual: ?termio.Manual.Config = if (comptime @hasDecl(apprt.runtime.Surface, "manualIO"))
++            rt_surface.manualIO()
++        else
++            null;
+ 
+-            // don't leak GHOSTTY_LOG to any subprocesses
+-            _ = env.orderedRemove("GHOSTTY_LOG");
++        var io_backend: termio.Backend = backend: {
++            if (manual) |m| break :backend .{ .manual = termio.Manual.init(m) };
+ 
+-            var buf: [18]u8 = undefined;
+-            try env.put(
+-                "GHOSTTY_SURFACE_ID",
+-                std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+-            );
++            // Exec.init takes ownership of the env even if it fails, so the
++            // errdefer for it must not reach past the call.
++            const env = termio_env: {
++                var env = rt_surface.defaultTermioEnv() catch |err| env: {
++                    // If an error occurs, we don't want to block surface startup.
++                    log.warn("error getting env map for surface err={}", .{err});
++                    break :env global.environMap() catch std.process.Environ.Map.init(alloc);
++                };
++                errdefer env.deinit();
+ 
+-            break :termio_env env;
+-        };
++                // don't leak GHOSTTY_LOG to any subprocesses
++                _ = env.orderedRemove("GHOSTTY_LOG");
+ 
+-        // Initialize our IO backend
+-        var io_exec = try termio.Exec.init(alloc, .{
+-            .command = command,
+-            .command_wrapper = config.@"command-wrapper",
+-            .env = env,
+-            .env_override = config.env,
+-            .shell_integration = config.@"shell-integration",
+-            .shell_integration_features = config.@"shell-integration-features",
+-            .cursor_blink = config.@"cursor-style-blink",
+-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+-            .resources_dir = global.resourcesDir().host(),
+-            .term = config.term,
+-            .rt_pre_exec_info = .init(config),
+-            .rt_post_fork_info = .init(config),
+-        });
+-        errdefer io_exec.deinit();
++                var buf: [18]u8 = undefined;
++                try env.put(
++                    "GHOSTTY_SURFACE_ID",
++                    std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
++                );
++
++                break :termio_env env;
++            };
++
++            // Initialize our IO backend
++            const io_exec = try termio.Exec.init(alloc, .{
++                .command = command,
++                .command_wrapper = config.@"command-wrapper",
++                .env = env,
++                .env_override = config.env,
++                .shell_integration = config.@"shell-integration",
++                .shell_integration_features = config.@"shell-integration-features",
++                .cursor_blink = config.@"cursor-style-blink",
++                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
++                .resources_dir = global.resourcesDir().host(),
++                .term = config.term,
++                .rt_pre_exec_info = .init(config),
++                .rt_post_fork_info = .init(config),
++            });
++            break :backend .{ .exec = io_exec };
++        };
++        errdefer io_backend.deinit();
+ 
+         // Initialize our IO mailbox
+         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+@@ -720,7 +732,7 @@ pub fn init(
+             .size = size,
+             .full_config = config,
+             .config = io_config,
+-            .backend = .{ .exec = io_exec },
++            .backend = io_backend,
+             .mailbox = io_mailbox,
+             .renderer_state = &self.renderer_state,
+             .renderer_wakeup = render_thread.wakeup,
+@@ -1427,6 +1439,8 @@ fn childExitedAbnormally(
+     // Build up our command for the error message
+     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
+         .exec => |*exec| exec.subprocess.args,
++        // No child process, so no exit to report.
++        .manual => return,
+     });
+     const runtime_str = try alloc.print("{d} ms", .{info.runtime_ms});
+ 
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index bfc4ad89f..90f6f90c3 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
+ const CoreApp = @import("../App.zig");
+ const CoreInspector = @import("../inspector/main.zig").Inspector;
+ const CoreSurface = @import("../Surface.zig");
++const termio = @import("../termio.zig");
+ const configpkg = @import("../config.zig");
+ const Config = configpkg.Config;
+ const String = @import("../main_c.zig").String;
+@@ -454,6 +455,12 @@ pub const Surface = struct {
+     cursor_pos: apprt.CursorPos,
+     inspector: ?*Inspector = null,
+ 
++    /// Set for a manual surface: no pty and no child process. The host feeds
++    /// bytes with ghostty_surface_feed and takes everything the terminal
++    /// sends to the program through these callbacks. Null for a normal
++    /// surface. Read by the core surface while it starts its IO.
++    manual: ?termio.Manual.Config = null,
++
+     /// The current title of the surface. The embedded apprt saves this so
+     /// that getTitle works without the implementer needing to save it.
+     title: ?[:0]const u8 = null,
+@@ -523,6 +530,17 @@ pub const Surface = struct {
+         /// with the child's startup, and under launch load the child wins.
+         initial_width_px: u32 = 0,
+         initial_height_px: u32 = 0,
++
++        /// Make a manual surface: no pty, no child process, and no command,
++        /// working directory, env or shell integration (they are ignored).
++        /// `initial_input` is not ignored: it goes out through `manual_write`.
++        /// The host feeds the terminal with ghostty_surface_feed. Input and
++        /// terminal replies go out through `manual_write`, and every size
++        /// change goes out through `manual_resize`. Both get the surface's
++        /// `userdata`. See termio/Manual.zig for the rules of the callbacks.
++        manual_io: bool = false,
++        manual_write: ?termio.Manual.WriteFn = null,
++        manual_resize: ?termio.Manual.ResizeFn = null,
+     };
+ 
+     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+@@ -540,6 +558,11 @@ pub const Surface = struct {
+             else
+                 .{ .width = 800, .height = 600 },
+             .cursor_pos = .{ .x = -1, .y = -1 },
++            .manual = if (opts.manual_io) .{
++                .userdata = opts.userdata,
++                .write = opts.manual_write,
++                .resize = opts.manual_resize,
++            } else null,
+         };
+ 
+         // Add ourselves to the list of surfaces on the app.
+@@ -717,6 +740,11 @@ pub const Surface = struct {
+         return &self.core_surface;
+     }
+ 
++    /// The manual IO callbacks of this surface, or null for a normal one.
++    pub fn manualIO(self: *const Surface) ?termio.Manual.Config {
++        return self.manual;
++    }
++
+     pub fn rtApp(self: *const Surface) *App {
+         return self.app;
+     }
+@@ -2089,6 +2117,25 @@ pub const CAPI = struct {
+         surface.focusCallback(focused);
+     }
+ 
++    /// Feed bytes to the terminal of a surface, as if a program had written
++    /// them to the pty. This is the input of a manual surface
++    /// (`manual_io`). It takes the renderer lock, so call it from any
++    /// thread except from inside a manual callback. The bytes are copied
++    /// into the terminal before this returns. Calls from one thread are
++    /// processed in order.
++    export fn ghostty_surface_feed(
++        surface: *Surface,
++        ptr: [*]const u8,
++        len: usize,
++    ) void {
++        if (len == 0) return;
++        surface.core_surface.io.processOutput(ptr[0..len]);
++
++        // Let the renderer take the lock, as the pty read thread does. The
++        // mutex is unfair, and a host that feeds in a loop would starve it.
++        surface.core_surface.renderer_state.yieldToDemand(global.io());
++    }
++
+     /// Update the occlusion state of a surface.
+     export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
+         surface.occlusionCallback(visible);
+diff --git a/src/termio.zig b/src/termio.zig
+index b16885109..03e8817ee 100644
+--- a/src/termio.zig
++++ b/src/termio.zig
+@@ -23,6 +23,7 @@ const message = @import("termio/message.zig");
+ pub const backend = @import("termio/backend.zig");
+ pub const mailbox = @import("termio/mailbox.zig");
+ pub const Exec = @import("termio/Exec.zig");
++pub const Manual = @import("termio/Manual.zig");
+ pub const Options = @import("termio/Options.zig");
+ pub const Termio = @import("termio/Termio.zig");
+ pub const Thread = @import("termio/Thread.zig");
+diff --git a/src/termio/Manual.zig b/src/termio/Manual.zig
+new file mode 100644
+index 000000000..a607553fe
+--- /dev/null
++++ b/src/termio/Manual.zig
+@@ -0,0 +1,217 @@
++//! The manual backend: a surface with no pty and no child process.
++//!
++//! The embedder feeds the terminal with bytes (`Termio.processOutput`, the C
++//! function `ghostty_surface_feed`). Everything that a pty would receive
++//! (key input, pastes, terminal replies such as device attributes, focus
++//! and size reports) goes out through the `write` callback. A change of the
++//! grid or pixel size goes out through the `resize` callback.
++//!
++//! Both callbacks run on the termio thread, and either can run with the
++//! renderer state lock held (size, focus and color-scheme reports, and the
++//! resize callback itself). A callback must therefore not call a libghostty
++//! function that takes that lock (`ghostty_surface_feed`,
++//! `ghostty_surface_read_text`, and others). It must not take a lock that a
++//! thread holds while it calls `ghostty_surface_feed`, and it must not block
++//! for long. Copy what it needs and return.
++const Manual = @This();
++
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const renderer = @import("../renderer.zig");
++const terminal = @import("../terminal/main.zig");
++const termio = @import("../termio.zig");
++const ProcessInfo = @import("../pty.zig").ProcessInfo;
++
++/// Receives bytes that the terminal sends to the program. The pointer is
++/// valid only during the call. Called in order, from the termio thread.
++pub const WriteFn = *const fn (
++    userdata: ?*anyopaque,
++    data: [*]const u8,
++    len: usize,
++) callconv(.c) void;
++
++/// Receives the new size of the terminal. Called from the termio thread,
++/// with the renderer state lock held, each time that the size changes.
++pub const ResizeFn = *const fn (
++    userdata: ?*anyopaque,
++    columns: u16,
++    rows: u16,
++    width_px: u32,
++    height_px: u32,
++) callconv(.c) void;
++
++pub const Config = struct {
++    userdata: ?*anyopaque = null,
++    write: ?WriteFn = null,
++    resize: ?ResizeFn = null,
++};
++
++config: Config,
++
++pub fn init(config: Config) Manual {
++    return .{ .config = config };
++}
++
++pub fn deinit(self: *Manual) void {
++    _ = self;
++}
++
++/// There is no pty, so there is nothing to set up on the terminal.
++pub fn initTerminal(self: *Manual, term: *terminal.Terminal) void {
++    _ = self;
++    _ = term;
++}
++
++pub fn threadEnter(
++    self: *Manual,
++    alloc: Allocator,
++    io: *termio.Termio,
++    td: *termio.Termio.ThreadData,
++) !void {
++    _ = self;
++    _ = alloc;
++    _ = io;
++    td.backend = .{ .manual = {} };
++}
++
++pub fn threadExit(self: *Manual, td: *termio.Termio.ThreadData) void {
++    _ = self;
++    _ = td;
++}
++
++pub fn focusGained(
++    self: *Manual,
++    td: *termio.Termio.ThreadData,
++    focused: bool,
++) !void {
++    _ = self;
++    _ = td;
++    _ = focused;
++}
++
++pub fn resize(
++    self: *Manual,
++    grid_size: renderer.GridSize,
++    screen_size: renderer.ScreenSize,
++) !void {
++    const cb = self.config.resize orelse return;
++    cb(
++        self.config.userdata,
++        grid_size.columns,
++        grid_size.rows,
++        screen_size.width,
++        screen_size.height,
++    );
++}
++
++/// Send bytes to the program, through the write callback. In linefeed mode
++/// each CR becomes CR LF, as the pty backend does.
++pub fn queueWrite(
++    self: *Manual,
++    alloc: Allocator,
++    td: *termio.Termio.ThreadData,
++    data: []const u8,
++    linefeed: bool,
++) !void {
++    _ = td;
++    const cb = self.config.write orelse return;
++    if (data.len == 0) return;
++
++    if (!linefeed) {
++        cb(self.config.userdata, data.ptr, data.len);
++        return;
++    }
++
++    var list: std.ArrayList(u8) = .empty;
++    defer list.deinit(alloc);
++    try list.ensureTotalCapacity(alloc, data.len + 8);
++    for (data) |ch| {
++        try list.append(alloc, ch);
++        if (ch == '\r') try list.append(alloc, '\n');
++    }
++    cb(self.config.userdata, list.items.ptr, list.items.len);
++}
++
++/// There is no process, so there is nothing to report.
++pub fn getProcessInfo(self: *Manual, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
++    _ = self;
++    return null;
++}
++
++const TestSink = struct {
++    bytes: std.ArrayList(u8) = .empty,
++    size: ?[4]u32 = null,
++    writes: usize = 0,
++
++    fn write(ud: ?*anyopaque, data: [*]const u8, len: usize) callconv(.c) void {
++        const self: *TestSink = @ptrCast(@alignCast(ud.?));
++        self.bytes.appendSlice(std.testing.allocator, data[0..len]) catch @panic("oom");
++        self.writes += 1;
++    }
++
++    fn resize(ud: ?*anyopaque, cols: u16, rows: u16, w: u32, h: u32) callconv(.c) void {
++        const self: *TestSink = @ptrCast(@alignCast(ud.?));
++        self.size = .{ cols, rows, w, h };
++    }
++};
++
++fn testTd() termio.Termio.ThreadData {
++    return .{
++        .alloc = std.testing.allocator,
++        .loop = undefined,
++        .renderer_state = undefined,
++        .surface_mailbox = undefined,
++        .backend = .{ .manual = {} },
++        .mailbox = undefined,
++    };
++}
++
++test "manual: input goes out through the write callback" {
++    var sink: TestSink = .{};
++    defer sink.bytes.deinit(std.testing.allocator);
++    var m: Manual = .init(.{
++        .userdata = &sink,
++        .write = TestSink.write,
++        .resize = TestSink.resize,
++    });
++    var td = testTd();
++
++    try m.queueWrite(std.testing.allocator, &td, "ls\r", false);
++    try m.queueWrite(std.testing.allocator, &td, "\x1b[?62;22c", false);
++    try std.testing.expectEqualStrings("ls\r\x1b[?62;22c", sink.bytes.items);
++    try std.testing.expectEqual(@as(usize, 2), sink.writes);
++
++    // An empty write does not call out.
++    try m.queueWrite(std.testing.allocator, &td, "", false);
++    try std.testing.expectEqual(@as(usize, 2), sink.writes);
++}
++
++test "manual: linefeed mode turns CR into CR LF" {
++    var sink: TestSink = .{};
++    defer sink.bytes.deinit(std.testing.allocator);
++    var m: Manual = .init(.{ .userdata = &sink, .write = TestSink.write });
++    var td = testTd();
++
++    try m.queueWrite(std.testing.allocator, &td, "a\rb\r", true);
++    try std.testing.expectEqualStrings("a\r\nb\r\n", sink.bytes.items);
++}
++
++test "manual: size goes out through the resize callback" {
++    var sink: TestSink = .{};
++    defer sink.bytes.deinit(std.testing.allocator);
++    var m: Manual = .init(.{ .userdata = &sink, .resize = TestSink.resize });
++
++    try m.resize(
++        .{ .columns = 120, .rows = 40 },
++        .{ .width = 1200, .height = 800 },
++    );
++    try std.testing.expectEqual([4]u32{ 120, 40, 1200, 800 }, sink.size.?);
++}
++
++test "manual: no callbacks is a safe no-op" {
++    var m: Manual = .init(.{});
++    var td = testTd();
++    try m.queueWrite(std.testing.allocator, &td, "x", true);
++    try m.resize(.{ .columns = 1, .rows = 1 }, .{ .width = 1, .height = 1 });
++    try std.testing.expect(m.getProcessInfo(.foreground_pid) == null);
++}
+diff --git a/src/termio/backend.zig b/src/termio/backend.zig
+index c29009acb..6cef985ae 100644
+--- a/src/termio/backend.zig
++++ b/src/termio/backend.zig
+@@ -11,28 +11,35 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
+ const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+ 
+ /// The kinds of backends.
+-pub const Kind = enum { exec };
++pub const Kind = enum { exec, manual };
+ 
+ /// Configuration for the various backend types.
+ pub const Config = union(Kind) {
+     /// Exec uses posix exec to run a command with a pty.
+     exec: termio.Exec.Config,
++
++    /// Manual has no pty: the embedder feeds bytes and receives writes
++    /// through callbacks.
++    manual: termio.Manual.Config,
+ };
+ 
+ /// Backend implementations. A backend is responsible for owning the pty
+ /// behavior and providing read/write capabilities.
+ pub const Backend = union(Kind) {
+     exec: termio.Exec,
++    manual: termio.Manual,
+ 
+     pub fn deinit(self: *Backend) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(),
++            .manual => |*manual| manual.deinit(),
+         }
+     }
+ 
+     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
+         switch (self.*) {
+             .exec => |*exec| exec.initTerminal(t),
++            .manual => |*manual| manual.initTerminal(t),
+         }
+     }
+ 
+@@ -44,12 +51,14 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.threadEnter(alloc, io, td),
++            .manual => |*manual| try manual.threadEnter(alloc, io, td),
+         }
+     }
+ 
+     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
+         switch (self.*) {
+             .exec => |*exec| exec.threadExit(td),
++            .manual => |*manual| manual.threadExit(td),
+         }
+     }
+ 
+@@ -60,6 +69,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.focusGained(td, focused),
++            .manual => |*manual| try manual.focusGained(td, focused),
+         }
+     }
+ 
+@@ -70,6 +80,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.resize(grid_size, screen_size),
++            .manual => |*manual| try manual.resize(grid_size, screen_size),
+         }
+     }
+ 
+@@ -82,6 +93,7 @@ pub const Backend = union(Kind) {
+     ) !void {
+         switch (self.*) {
+             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
++            .manual => |*manual| try manual.queueWrite(alloc, td, data, linefeed),
+         }
+     }
+ 
+@@ -108,6 +120,7 @@ pub const Backend = union(Kind) {
+     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+         return switch (self.*) {
+             .exec => |*exec| exec.getProcessInfo(info),
++            .manual => |*manual| manual.getProcessInfo(info),
+         };
+     }
+ };
+@@ -116,9 +129,13 @@ pub const Backend = union(Kind) {
+ pub const ThreadData = union(Kind) {
+     exec: termio.Exec.ThreadData,
+ 
++    /// The manual backend keeps no state on the termio thread.
++    manual: void,
++
+     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
+         switch (self.*) {
+             .exec => |*exec| exec.deinit(alloc),
++            .manual => {},
+         }
+     }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

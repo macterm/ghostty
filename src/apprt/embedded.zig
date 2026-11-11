@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
+const termio = @import("../termio.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
@@ -454,6 +455,12 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// Set for a manual surface: no pty and no child process. The host feeds
+    /// bytes with ghostty_surface_feed and takes everything the terminal
+    /// sends to the program through these callbacks. Null for a normal
+    /// surface. Read by the core surface while it starts its IO.
+    manual: ?termio.Manual.Config = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -499,6 +506,41 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// A wrapper command (argv) prepended to the final resolved command.
+        /// See the `command-wrapper` config docs. Each element is a NUL
+        /// terminated argument; `command_wrapper_count` is the element count.
+        /// When null/empty, no wrapper is applied.
+        command_wrapper: ?[*]const [*:0]const u8 = null,
+        command_wrapper_count: usize = 0,
+
+        /// Force `shell-integration = none` for this surface only, regardless of
+        /// the global config. For surfaces that run a self-managing command
+        /// (e.g. a script runner that emits its own OSC sequences) and must not
+        /// have Ghostty's integration injected into the shell.
+        disable_shell_integration: bool = false,
+
+        /// The size of the view in pixels at creation, when the host already
+        /// knows it. Zero keeps the 800x600 placeholder that the host replaces
+        /// with its first `ghostty_surface_set_size`. The pty opens at the
+        /// size the surface has here, so a program that reads its window
+        /// size at startup (a session multiplexer's attach client, anything
+        /// that calls TIOCGWINSZ once) sees the placeholder grid when the host
+        /// reports the real size a moment later. That later resize is a race
+        /// with the child's startup, and under launch load the child wins.
+        initial_width_px: u32 = 0,
+        initial_height_px: u32 = 0,
+
+        /// Make a manual surface: no pty, no child process, and no command,
+        /// working directory, env or shell integration (they are ignored).
+        /// `initial_input` is not ignored: it goes out through `manual_write`.
+        /// The host feeds the terminal with ghostty_surface_feed. Input and
+        /// terminal replies go out through `manual_write`, and every size
+        /// change goes out through `manual_resize`. Both get the surface's
+        /// `userdata`. See termio/Manual.zig for the rules of the callbacks.
+        manual_io: bool = false,
+        manual_write: ?termio.Manual.WriteFn = null,
+        manual_resize: ?termio.Manual.ResizeFn = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -511,8 +553,16 @@ pub const Surface = struct {
                 .x = @floatCast(opts.scale_factor),
                 .y = @floatCast(opts.scale_factor),
             },
-            .size = .{ .width = 800, .height = 600 },
+            .size = if (opts.initial_width_px > 0 and opts.initial_height_px > 0)
+                .{ .width = opts.initial_width_px, .height = opts.initial_height_px }
+            else
+                .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .manual = if (opts.manual_io) .{
+                .userdata = opts.userdata,
+                .write = opts.manual_write,
+                .resize = opts.manual_resize,
+            } else null,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -571,6 +621,25 @@ pub const Surface = struct {
                 config.command = .{ .shell = cmd };
                 config.@"wait-after-command" = true;
             }
+        }
+
+        // If we have a command wrapper from the options then we set it. This
+        // is always a direct (already-tokenized) command so paths with spaces
+        // survive without shell re-splitting.
+        if (opts.command_wrapper) |c_wrapper| {
+            if (opts.command_wrapper_count > 0) {
+                const alloc = config.arenaAlloc();
+                const argv = try alloc.alloc([:0]const u8, opts.command_wrapper_count);
+                for (c_wrapper[0..opts.command_wrapper_count], 0..) |arg, i| {
+                    argv[i] = try alloc.dupeSentinel(u8, std.mem.sliceTo(arg, 0), 0);
+                }
+                config.@"command-wrapper" = .{ .direct = argv };
+            }
+        }
+
+        // Opt this surface out of shell integration regardless of global config.
+        if (opts.disable_shell_integration) {
+            config.@"shell-integration" = .none;
         }
 
         // Apply any environment variables that were requested.
@@ -669,6 +738,11 @@ pub const Surface = struct {
 
     pub fn core(self: *Surface) *CoreSurface {
         return &self.core_surface;
+    }
+
+    /// The manual IO callbacks of this surface, or null for a normal one.
+    pub fn manualIO(self: *const Surface) ?termio.Manual.Config {
+        return self.manual;
     }
 
     pub fn rtApp(self: *const Surface) *App {
@@ -2041,6 +2115,25 @@ pub const CAPI = struct {
     /// Update the focused state of a surface.
     export fn ghostty_surface_set_focus(surface: *Surface, focused: bool) void {
         surface.focusCallback(focused);
+    }
+
+    /// Feed bytes to the terminal of a surface, as if a program had written
+    /// them to the pty. This is the input of a manual surface
+    /// (`manual_io`). It takes the renderer lock, so call it from any
+    /// thread except from inside a manual callback. The bytes are copied
+    /// into the terminal before this returns. Calls from one thread are
+    /// processed in order.
+    export fn ghostty_surface_feed(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
+
+        // Let the renderer take the lock, as the pty read thread does. The
+        // mutex is unfair, and a host that feeds in a loop would starve it.
+        surface.core_surface.renderer_state.yieldToDemand(global.io());
     }
 
     /// Update the occlusion state of a surface.
