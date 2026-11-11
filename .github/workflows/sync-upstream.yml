@@ -65,7 +65,7 @@ env:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       # The sync force-pushes main, and the fork-owned files include
       # workflows, so the push needs contents and workflows write. The job
@@ -82,7 +82,7 @@ jobs:
           permission-contents: write
           permission-workflows: write
 
-      - uses: actions/checkout@v7
+      - uses: useblacksmith/checkout@v1
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}

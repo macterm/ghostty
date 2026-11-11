@@ -26,7 +26,7 @@ jobs:
           - arch: x86_64
             runner: namespace-profile-ghostty-md
           - arch: aarch64
-            runner: namespace-profile-ghostty-md-arm64
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     runs-on: ${{ matrix.variant.runner }}
     steps:
       - name: Download Source Tarball Artifacts

@@ -16,7 +16,7 @@ jobs:
   # other tests `needs/if` to check them. Document the outputs.
   skip:
     if: github.repository == 'ghostty-org/ghostty'
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       # 'true' when all changed files are non-code (e.g. only VOUCHED.td),
       # signaling that all other jobs can be skipped entirely.
@@ -30,7 +30,7 @@ jobs:
       zig: ${{ steps.filter_any.outputs.zig }}
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter_every
         with:
@@ -85,7 +85,7 @@ jobs:
   required:
     name: "Required Checks: Test"
     if: always()
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs:
       - skip
       - build-gate
@@ -167,14 +167,14 @@ jobs:
 
   build-bench:
     # We build benchmarks on large because it uses fast mode
-    runs-on: namespace-profile-ghostty-lg
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -198,14 +198,14 @@ jobs:
   list-examples:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       zig: ${{ steps.list.outputs.zig }}
       cmake: ${{ steps.list.outputs.cmake }}
       swift: ${{ steps.list.outputs.swift }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
       - id: list
         name: List example directories
         run: |
@@ -225,7 +225,7 @@ jobs:
       matrix:
         dir: ${{ fromJSON(needs.list-examples.outputs.zig) }}
     name: Example ${{ matrix.dir }}
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: [skip, list-examples]
     env:
@@ -233,7 +233,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -258,7 +258,7 @@ jobs:
 
   build-example-zig-vt-macos-no-sdk:
     name: Example zig-vt (macOS, no SDK)
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -296,7 +296,7 @@ jobs:
   # the artifact.
   build-example-c-vt-macos-sdk:
     name: Example c-vt-build-info (macOS, SDK)
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -350,7 +350,7 @@ jobs:
       matrix:
         dir: ${{ fromJSON(needs.list-examples.outputs.cmake) }}
     name: Example ${{ matrix.dir }}
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: [skip, list-examples]
     env:
@@ -358,7 +358,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -393,7 +393,7 @@ jobs:
           # Studio which always uses MSVC and ignores CMAKE_C_COMPILER.
           - dir: c-vt-cmake-cross
     name: Example ${{ matrix.dir }} (Windows)
-    runs-on: namespace-profile-ghostty-windows
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 45
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: [skip, list-examples]
@@ -417,7 +417,7 @@ jobs:
   # ABI, which is also what Zig picks for a native Windows build.
   test-lib-vt-install-windows:
     name: libghostty-vt install layout (Windows)
-    runs-on: namespace-profile-ghostty-windows
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 45
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
@@ -501,7 +501,7 @@ jobs:
       matrix:
         dir: ${{ fromJSON(needs.list-examples.outputs.swift) }}
     name: Example ${{ matrix.dir }}
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: [skip, list-examples]
     env:
@@ -543,7 +543,7 @@ jobs:
           swift run
 
   build-cmake:
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -551,7 +551,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -583,7 +583,7 @@ jobs:
           ls -la zig-out/include/ghostty/
 
   test-lib-vt-pkgconfig:
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -591,7 +591,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -779,7 +779,7 @@ jobs:
   build-flatpak:
     strategy:
       fail-fast: false
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -787,7 +787,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -814,7 +814,7 @@ jobs:
   build-snap:
     strategy:
       fail-fast: false
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -822,7 +822,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -862,7 +862,7 @@ jobs:
             # doesn't work yet, we need a way to find msvc libc/c++ headers
             # x86_64-windows-msvc
           ]
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -870,7 +870,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -901,7 +901,7 @@ jobs:
             cpu: baseline
           - target: thumb-freestanding-eabi
             cpu: cortex_m4
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -909,7 +909,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -934,7 +934,7 @@ jobs:
             -Doptimize=ReleaseSafe
 
   build-libghostty-vt-wasm:
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -942,7 +942,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1052,14 +1052,14 @@ jobs:
           - "-all,+kitty_graphics"
           - "-all,+search"
     name: libghostty-vt -Dvt-features=${{ matrix.vt-features }}
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1105,11 +1105,11 @@ jobs:
   build-libghostty-vt-docs:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1139,14 +1139,14 @@ jobs:
   # Checks that the ABI of the Linux shared library didn't break since
   # test/abi/baseline.abi. See test/abi/README.md for what fails the check.
   abi-check:
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1229,7 +1229,7 @@ jobs:
             arch: arm64
             expect_encryption: false
             xcframework: false
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -1287,7 +1287,7 @@ jobs:
       matrix:
         target:
           [aarch64-linux-android, x86_64-linux-android, arm-linux-androideabi]
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -1296,7 +1296,7 @@ jobs:
       ANDROID_NDK_VERSION: r29
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1331,7 +1331,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
   build-libghostty-vt-windows:
-    runs-on: namespace-profile-ghostty-windows
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 45
     needs: build-gate
     steps:
@@ -1388,14 +1388,14 @@ jobs:
 
   # The x86_64 build is build-gate.
   build-linux:
-    runs-on: namespace-profile-ghostty-md-arm64
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1417,7 +1417,7 @@ jobs:
         run: nix develop -c zig build
 
   build-linux-libghostty:
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -1425,7 +1425,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1450,7 +1450,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [namespace-profile-ghostty-md, namespace-profile-ghostty-md-arm64]
+        os: [namespace-profile-ghostty-md, blacksmith-4vcpu-ubuntu-2404-arm]
         variant:
           - optimize: releasefast
             version: ".fast"
@@ -1468,7 +1468,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1500,7 +1500,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [namespace-profile-ghostty-md, namespace-profile-ghostty-md-arm64]
+        os: [namespace-profile-ghostty-md, blacksmith-4vcpu-ubuntu-2404-arm]
         variant:
           - releasefast
           - releasefast-no-simd
@@ -1514,7 +1514,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1549,7 +1549,7 @@ jobs:
             ".#$PKG.tests.build-example-c-vt-build-info"
 
   build-dist:
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     outputs:
       artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
@@ -1558,7 +1558,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1593,14 +1593,14 @@ jobs:
   # Builds the tarball again and runs the tests from inside it. build-dist
   # only builds the tarball so the jobs that use it don't wait on this.
   test-dist:
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1625,14 +1625,14 @@ jobs:
   # the tests from inside it. That is about as much work as test-lib-vt,
   # so it gets the same runner.
   build-dist-lib-vt:
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1668,11 +1668,11 @@ jobs:
 
   trigger-snap:
     if: github.event_name != 'pull_request'
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: [build-dist, build-snap]
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Trigger Snap workflow
         run: |
@@ -1686,11 +1686,11 @@ jobs:
 
   trigger-flatpak:
     if: github.event_name != 'pull_request'
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: [build-dist, build-flatpak]
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Trigger Flatpak workflow
         run: |
@@ -1755,7 +1755,7 @@ jobs:
   #         nix build .#libghostty-vt-debug-no-simd.tests.build-example-c-vt-build-info
 
   build-macos:
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /Users/runner/zig/local-cache
@@ -1803,7 +1803,7 @@ jobs:
             COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
 
   build-macos-xcode-27:
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /Users/runner/zig/local-cache
@@ -1839,7 +1839,7 @@ jobs:
         run: nix develop -c zig build -Demit-macos-app=false
 
   build-macos-freetype:
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /Users/runner/zig/local-cache
@@ -1887,13 +1887,13 @@ jobs:
   build-gate:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1917,13 +1917,13 @@ jobs:
   test:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -1974,13 +1974,13 @@ jobs:
   test-lib-vt:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2015,12 +2015,12 @@ jobs:
   test-lib-vt-offline:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2071,7 +2071,7 @@ jobs:
   test-lib-vt-freebsd:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
@@ -2084,7 +2084,7 @@ jobs:
       GHOSTTY_FREEBSD_VM_TEST_TIMEOUT: "1800"
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2174,14 +2174,14 @@ jobs:
   test-esctest:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     continue-on-error: true
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2232,10 +2232,10 @@ jobs:
   test-kaitai:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2317,14 +2317,14 @@ jobs:
         # -Dsimd=true is the default, which the GTK tests already cover.
         simd: ["false"]
     name: Test -Dsimd=${{ matrix.simd }}
-    runs-on: namespace-profile-ghostty-md
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2352,14 +2352,14 @@ jobs:
       matrix:
         sentry: ["true", "false"]
     name: Build -Dsentry=${{ matrix.sentry }}
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2382,7 +2382,7 @@ jobs:
           nix develop -c zig build -Dsentry=${{ matrix.sentry }}
 
   test-macos:
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /Users/runner/zig/local-cache
@@ -2423,14 +2423,14 @@ jobs:
       matrix:
         i18n: ["true", "false"]
     name: Build -Di18n=${{ matrix.i18n }}
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2454,7 +2454,7 @@ jobs:
 
   test-fuzz-libghostty:
     name: Build test/fuzz-libghostty
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -2462,7 +2462,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2490,13 +2490,13 @@ jobs:
   zig-fmt:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true' && needs.skip.outputs.zig == 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2519,7 +2519,7 @@ jobs:
     name: "GitHub Actions Pins"
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true' && needs.skip.outputs.actions_pins == 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     permissions:
       contents: read
@@ -2527,7 +2527,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2551,13 +2551,13 @@ jobs:
   prettier:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2578,7 +2578,7 @@ jobs:
 
   swiftlint:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true' && needs.skip.outputs.macos == 'true'
-    runs-on: namespace-profile-ghostty-macos-golden
+    runs-on: blacksmith-6vcpu-macos-15
     needs: skip
     timeout-minutes: 60
     steps:
@@ -2609,13 +2609,13 @@ jobs:
   alejandra:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true' && needs.skip.outputs.nix == 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2637,13 +2637,13 @@ jobs:
   typos:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2665,13 +2665,13 @@ jobs:
   shellcheck:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true' && needs.skip.outputs.shell == 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2698,13 +2698,13 @@ jobs:
   translations:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2726,13 +2726,13 @@ jobs:
   blueprint-compiler:
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true' && needs.skip.outputs.blueprints == 'true'
     needs: skip
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: useblacksmith/checkout@v1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -2763,7 +2763,7 @@ jobs:
             args: -Dfreetype=true
           - pkg: wuffs
     name: Test pkg/${{ matrix.pkg }} ${{ matrix.args }}
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.repository == 'ghostty-org/ghostty' && needs.skip.outputs.skip != 'true'
     needs: skip
     env:
@@ -2771,7 +2771,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -2795,7 +2795,7 @@ jobs:
 
   test-debian-13:
     name: Test build on Debian 13
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     needs: build-dist
     steps:
@@ -2816,7 +2816,7 @@ jobs:
           tar --verbose --extract --strip-components 1 --directory dist --file ghostty-source.tar.gz
 
       - name: Build and push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: useblacksmith/build-push-action@v2 # v7.4.0
         with:
           context: dist
           file: dist/src/build/docker/debian/Dockerfile
@@ -2825,7 +2825,7 @@ jobs:
 
   valgrind:
     if: github.repository == 'ghostty-org/ghostty'
-    runs-on: namespace-profile-ghostty-lg
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     needs: build-gate
     env:
@@ -2833,7 +2833,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0

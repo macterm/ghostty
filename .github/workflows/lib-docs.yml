@@ -61,7 +61,7 @@ jobs:
     if: |
       github.repository == 'ghostty-org/ghostty' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Only one deploy of a site can run at a time. Each job has its own group
     # because a group keeps a single pending run, so with a shared group, a
     # push to main could replace a pending release deploy.
@@ -70,7 +70,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -117,13 +117,13 @@ jobs:
           github.event.workflow_run.conclusion == 'success'
         )
       )
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     concurrency:
       group: ${{ github.workflow }}-release
       cancel-in-progress: false
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: useblacksmith/checkout@v1 # v7.0.1
         with:
           # Important so that the checkout has every tag
           fetch-depth: 0
