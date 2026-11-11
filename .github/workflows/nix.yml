@@ -8,7 +8,7 @@ concurrency:
 jobs:
   required:
     name: "Required Checks: Nix"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs:
       - check-zig-cache-hash
     steps:
@@ -33,13 +33,13 @@ jobs:
 
   check-zig-cache-hash:
     if: github.repository == 'ghostty-org/ghostty'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@v1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:

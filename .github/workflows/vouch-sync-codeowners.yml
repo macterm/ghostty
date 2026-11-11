@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-xsm
     steps:
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: app-token
@@ -19,7 +19,7 @@ jobs:
           app-id: ${{ secrets.VOUCH_APP_ID }}
           private-key: ${{ secrets.VOUCH_APP_PRIVATE_KEY }}
 
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
 

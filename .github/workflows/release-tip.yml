@@ -26,14 +26,14 @@ jobs:
         github.repository_owner == 'ghostty-org' &&
         github.ref_name == 'main'
       )
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     outputs:
       should_skip: ${{ steps.check.outputs.should_skip }}
       build: ${{ steps.extract_build_info.outputs.build }}
       commit: ${{ steps.extract_build_info.outputs.commit }}
       commit_long: ${{ steps.extract_build_info.outputs.commit_long }}
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Important so that build number generation works
           fetch-depth: 0
@@ -116,11 +116,11 @@ jobs:
           fi
 
   tag:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup, build-macos]
     if: needs.setup.outputs.should_skip != 'true'
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tip Tag
         run: |
           git config user.name "github-actions[bot]"
@@ -129,13 +129,13 @@ jobs:
           git push --force origin tip
 
   sentry-dsym-debug-slow:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup, build-macos-debug-slow]
     if: needs.setup.outputs.should_skip != 'true'
     env:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install sentry-cli
         run: |
@@ -152,13 +152,13 @@ jobs:
           sentry-cli dif upload --project ghostty --wait dsym.zip
 
   sentry-dsym-debug-fast:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup, build-macos-debug-fast]
     if: needs.setup.outputs.should_skip != 'true'
     env:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install sentry-cli
         run: |
@@ -175,13 +175,13 @@ jobs:
           sentry-cli dif upload --project ghostty --wait dsym.zip
 
   sentry-dsym:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup, build-macos]
     if: needs.setup.outputs.should_skip != 'true'
     env:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install sentry-cli
         run: |
@@ -208,12 +208,12 @@ jobs:
           github.ref_name == 'main'
         )
       )
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -262,13 +262,13 @@ jobs:
           github.ref_name == 'main'
         )
       )
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     env:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
@@ -336,7 +336,7 @@ jobs:
           github.ref_name == 'main'
         )
       )
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: namespace-profile-ghostty-macos-golden
     env:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
       ZIG_LOCAL_CACHE_DIR: /Users/runner/zig/local-cache
@@ -431,14 +431,14 @@ jobs:
           github.ref_name == 'main'
         )
       )
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     env:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@v1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Cache
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
@@ -561,7 +561,7 @@ jobs:
         )
       )
 
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: namespace-profile-ghostty-macos-golden
     timeout-minutes: 90
     env:
       GHOSTTY_BUILD: ${{ needs.setup.outputs.build }}
@@ -817,7 +817,7 @@ jobs:
         )
       )
 
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: namespace-profile-ghostty-macos-golden
     timeout-minutes: 90
     env:
       GHOSTTY_BUILD: ${{ needs.setup.outputs.build }}
@@ -1014,7 +1014,7 @@ jobs:
         )
       )
 
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: namespace-profile-ghostty-macos-golden
     timeout-minutes: 90
     env:
       GHOSTTY_BUILD: ${{ needs.setup.outputs.build }}

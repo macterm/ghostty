@@ -108,7 +108,7 @@ jobs:
   #   lib_version_string  the version to pass to the builds with
   #                       -Dlib-version-string, set only for a rehearsal
   setup:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     outputs:
       release: ${{ steps.mode.outputs.release }}
       ref: ${{ steps.mode.outputs.ref }}
@@ -160,7 +160,7 @@ jobs:
           cat "$GITHUB_OUTPUT"
 
       - name: Checkout code
-        uses: useblacksmith/checkout@v1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.mode.outputs.ref }}
           # Fetch all history and tags so the tag check below sees them.
@@ -215,7 +215,7 @@ jobs:
   # Every job names its files with the version from setup, so the tarball
   # has to carry exactly that name too.
   source-tarball:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-md
     needs: [setup]
     env:
       TAG: ${{ needs.setup.outputs.tag }}
@@ -224,7 +224,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
@@ -294,7 +294,7 @@ jobs:
   #
   # Like the source tarball, it must be named after the version from setup.
   deps-tarball:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup]
     env:
       TAG: ${{ needs.setup.outputs.tag }}
@@ -303,7 +303,7 @@ jobs:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
@@ -406,14 +406,14 @@ jobs:
   # test-lib-vt-offline job there covers fetch-zig-cache.sh, the way to
   # build without the dependency tarball.
   verify-offline:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-md
     needs: [setup, source-tarball, deps-tarball]
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
       # The checkout only provides flake.nix, and with it the toolchain.
       # The build runs in the unpacked tarball.
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
@@ -549,7 +549,7 @@ jobs:
   # iOS simulator in one bundle. The build steps match the tip release in
   # release-tip.yml.
   xcframework:
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: namespace-profile-ghostty-macos-golden
     needs: [setup]
     env:
       TAG: ${{ needs.setup.outputs.tag }}
@@ -624,7 +624,7 @@ jobs:
   # and one for size (ReleaseSmall). The build steps match the tip release
   # in release-tip.yml.
   wasm:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup]
     env:
       TAG: ${{ needs.setup.outputs.tag }}
@@ -634,7 +634,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@v1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
@@ -755,7 +755,7 @@ jobs:
   # the same script on every change. A change to this layout has to keep
   # that check passing.
   windows:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup]
     env:
       TAG: ${{ needs.setup.outputs.tag }}
@@ -765,7 +765,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@v1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
@@ -933,7 +933,7 @@ jobs:
   #
   # The runner is x64, so the aarch64 zip only gets the first check.
   verify-windows:
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: namespace-profile-ghostty-windows
     needs: [setup, windows]
     timeout-minutes: 30
     env:
@@ -988,13 +988,13 @@ jobs:
   # checkout rather than the tarball, because the tarball leaves out
   # dist/doxygen.
   docs:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     needs: [setup]
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@v1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
@@ -1074,12 +1074,12 @@ jobs:
       - windows
       - verify-windows
       - docs
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: namespace-profile-ghostty-sm
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     steps:
       # The checkout only provides flake.nix, and with it minisign.
-      - uses: useblacksmith/checkout@v1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
