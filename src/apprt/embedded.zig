@@ -573,6 +573,32 @@ pub const Surface = struct {
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
 
+        try applyOptions(&config, opts);
+
+        // Initialize our surface right away. We're given a view that is
+        // ready to use.
+        try self.core_surface.init(
+            app.core_app.alloc,
+            &config,
+            app.core_app,
+            app,
+            self,
+        );
+        errdefer self.core_surface.deinit();
+
+        // If our options requested a specific font-size, set that.
+        if (opts.font_size != 0) {
+            var font_size = self.core_surface.font_size;
+            font_size.points = opts.font_size;
+            try self.core_surface.setFontSize(font_size);
+        }
+    }
+
+    /// Apply the options of a new surface to its config: the working
+    /// directory, command, command wrapper, shell integration, env and
+    /// initial input. `ghostty_launch_resolve` shares it with `init`, so that
+    /// both read the options in the same way.
+    fn applyOptions(config: *Config, opts: Options) !void {
         // If we have a working directory from the options then we set it.
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
@@ -679,24 +705,6 @@ pub const Surface = struct {
         // Wait after command
         if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
-        }
-
-        // Initialize our surface right away. We're given a view that is
-        // ready to use.
-        try self.core_surface.init(
-            app.core_app.alloc,
-            &config,
-            app.core_app,
-            app,
-            self,
-        );
-        errdefer self.core_surface.deinit();
-
-        // If our options requested a specific font-size, set that.
-        if (opts.font_size != 0) {
-            var font_size = self.core_surface.font_size;
-            font_size.points = opts.font_size;
-            try self.core_surface.setFontSize(font_size);
         }
     }
 
@@ -1288,6 +1296,13 @@ pub const Surface = struct {
 
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
         _ = self;
+        return defaultEnv();
+    }
+
+    /// The environment that a new surface starts from, before the options
+    /// and the shell integration. Not tied to a surface, so that
+    /// `ghostty_launch_resolve` can use it.
+    fn defaultEnv() !std.process.Environ.Map {
         var env = try global.environMap();
         errdefer env.deinit();
 
@@ -1928,6 +1943,116 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
     ) !*Surface {
         return try app.newSurface(opts.*);
+    }
+
+    /// A resolved launch: what a surface with these options would run in
+    /// its pty. The fields are valid until `ghostty_launch_free`.
+    pub const Launch = extern struct {
+        /// The argv.
+        argv: [*]const [*:0]const u8,
+        argv_count: usize,
+
+        /// The full environment, as the child gets it.
+        env: [*]const EnvVar,
+        env_count: usize,
+
+        /// The working directory, or null for the one of the process.
+        cwd: ?[*:0]const u8,
+
+        /// Owned by libghostty. Do not touch.
+        internal: ?*anyopaque,
+    };
+
+    /// Resolve what `ghostty_surface_new` would run in a pty for these
+    /// options, and start nothing. It is the code of the exec backend before
+    /// its fork: the command, the command wrapper, the login(1) wrapping of
+    /// macOS, the shell integration, TERM and the other variables of
+    /// libghostty, the `env` of the config and the folder. The options are
+    /// read as `ghostty_surface_new` reads them (`manual_io` and the
+    /// callbacks are ignored). The environment starts from the one of the
+    /// process, as for a surface, without GHOSTTY_SURFACE_ID, which a surface
+    /// that does not exist yet has no value for. Returns false on failure.
+    export fn ghostty_launch_resolve(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        out: *Launch,
+    ) bool {
+        launch_resolve_(app, opts, out) catch |err| {
+            log.err("error resolving launch err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    fn launch_resolve_(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        out: *Launch,
+    ) !void {
+        const alloc = global.alloc();
+
+        var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
+        defer config.deinit();
+        try Surface.applyOptions(&config, opts.*);
+
+        // The result lives in the arena of the launch, which the C struct
+        // owns through this heap object. Do not copy the C struct before it
+        // is freed.
+        const holder = try alloc.create(termio.Exec.Launch);
+        errdefer alloc.destroy(holder);
+
+        var env = try Surface.defaultEnv();
+        _ = env.orderedRemove("GHOSTTY_LOG");
+
+        // Exec.resolveLaunch takes the env, also when it fails.
+        holder.* = try termio.Exec.resolveLaunch(alloc, .{
+            .command = config.command,
+            .command_wrapper = config.@"command-wrapper",
+            .env = env,
+            .env_override = config.env,
+            .shell_integration = config.@"shell-integration",
+            .shell_integration_features = config.@"shell-integration-features",
+            .cursor_blink = config.@"cursor-style-blink",
+            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+            .resources_dir = global.resourcesDir().host(),
+            .term = config.term,
+            .rt_pre_exec_info = .init(&config),
+            .rt_post_fork_info = .init(&config),
+        });
+        errdefer holder.deinit();
+        const a = holder.arena.allocator();
+
+        const argv = try a.alloc([*:0]const u8, holder.args.len);
+        // Copy each argument: the command that Exec resolved can point into
+        // the config, which is freed when this function returns.
+        for (holder.args, 0..) |arg, i| argv[i] = (try a.dupeSentinel(u8, arg, 0)).ptr;
+
+        const vars = try a.alloc(EnvVar, holder.env.count());
+        var it = holder.env.iterator();
+        var i: usize = 0;
+        while (it.next()) |pair| : (i += 1) vars[i] = .{
+            .key = try a.dupeSentinel(u8, pair.key_ptr.*, 0),
+            .value = try a.dupeSentinel(u8, pair.value_ptr.*, 0),
+        };
+
+        out.* = .{
+            .argv = argv.ptr,
+            .argv_count = holder.args.len,
+            .env = vars.ptr,
+            .env_count = vars.len,
+            .cwd = if (holder.cwd) |cwd| cwd.ptr else null,
+            .internal = holder,
+        };
+    }
+
+    /// Free a launch from `ghostty_launch_resolve`. A second call does nothing.
+    export fn ghostty_launch_free(launch: *Launch) void {
+        const holder: *termio.Exec.Launch = @ptrCast(@alignCast(launch.internal orelse return));
+        holder.deinit();
+        global.alloc().destroy(holder);
+        launch.internal = null;
+        launch.argv_count = 0;
+        launch.env_count = 0;
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
