@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
+const termio = @import("../termio.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
@@ -454,6 +455,12 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// Set for a manual surface: no pty and no child process. The host feeds
+    /// bytes with ghostty_surface_feed and takes everything the terminal
+    /// sends to the program through these callbacks. Null for a normal
+    /// surface. Read by the core surface while it starts its IO.
+    manual: ?termio.Manual.Config = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -523,6 +530,17 @@ pub const Surface = struct {
         /// with the child's startup, and under launch load the child wins.
         initial_width_px: u32 = 0,
         initial_height_px: u32 = 0,
+
+        /// Make a manual surface: no pty, no child process, and no command,
+        /// working directory, env or shell integration (they are ignored).
+        /// `initial_input` is not ignored: it goes out through `manual_write`.
+        /// The host feeds the terminal with ghostty_surface_feed. Input and
+        /// terminal replies go out through `manual_write`, and every size
+        /// change goes out through `manual_resize`. Both get the surface's
+        /// `userdata`. See termio/Manual.zig for the rules of the callbacks.
+        manual_io: bool = false,
+        manual_write: ?termio.Manual.WriteFn = null,
+        manual_resize: ?termio.Manual.ResizeFn = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -540,6 +558,11 @@ pub const Surface = struct {
             else
                 .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .manual = if (opts.manual_io) .{
+                .userdata = opts.userdata,
+                .write = opts.manual_write,
+                .resize = opts.manual_resize,
+            } else null,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -715,6 +738,11 @@ pub const Surface = struct {
 
     pub fn core(self: *Surface) *CoreSurface {
         return &self.core_surface;
+    }
+
+    /// The manual IO callbacks of this surface, or null for a normal one.
+    pub fn manualIO(self: *const Surface) ?termio.Manual.Config {
+        return self.manual;
     }
 
     pub fn rtApp(self: *const Surface) *App {
@@ -2087,6 +2115,25 @@ pub const CAPI = struct {
     /// Update the focused state of a surface.
     export fn ghostty_surface_set_focus(surface: *Surface, focused: bool) void {
         surface.focusCallback(focused);
+    }
+
+    /// Feed bytes to the terminal of a surface, as if a program had written
+    /// them to the pty. This is the input of a manual surface
+    /// (`manual_io`). It takes the renderer lock, so call it from any
+    /// thread except from inside a manual callback. The bytes are copied
+    /// into the terminal before this returns. Calls from one thread are
+    /// processed in order.
+    export fn ghostty_surface_feed(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
+
+        // Let the renderer take the lock, as the pty read thread does. The
+        // mutex is unfair, and a host that feeds in a loop would starve it.
+        surface.core_surface.renderer_state.yieldToDemand(global.io());
     }
 
     /// Update the occlusion state of a surface.

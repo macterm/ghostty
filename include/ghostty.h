@@ -521,6 +521,19 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+// Manual surface callbacks, called on a libghostty IO thread. The data pointer
+// is valid only during the call. Either callback can run with the renderer
+// lock held, so neither may call ghostty_surface_feed or another function that
+// reads the terminal, or take a lock that a thread holds while it feeds.
+typedef void (*ghostty_surface_manual_write_cb)(void* GHOSTTY_NULLABLE,
+                                                const uint8_t*,
+                                                size_t);
+typedef void (*ghostty_surface_manual_resize_cb)(void* GHOSTTY_NULLABLE,
+                                                 uint16_t,
+                                                 uint16_t,
+                                                 uint32_t,
+                                                 uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -539,6 +552,9 @@ typedef struct {
   bool disable_shell_integration;
   uint32_t initial_width_px;
   uint32_t initial_height_px;
+  bool manual_io;
+  ghostty_surface_manual_write_cb GHOSTTY_NULLABLE manual_write;
+  ghostty_surface_manual_resize_cb GHOSTTY_NULLABLE manual_resize;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1238,6 +1254,9 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+GHOSTTY_API void ghostty_surface_feed(ghostty_surface_t,
+                                      const uint8_t*,
+                                      uintptr_t);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
