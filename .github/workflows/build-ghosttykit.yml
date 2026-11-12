@@ -82,9 +82,10 @@ jobs:
       # value of the unknown_apc action). "CursorGlide" covers patches 0008,
       # 0009 and 0021 (the smooth cursor's glide, trail and morph). "manual:"
       # covers patch 0022 (the manual backend: input and size go out through
-      # the callbacks).
+      # the callbacks). "launch:" covers patch 0023 (the resolved launch of
+      # the exec backend).
       - name: Test downstream patches
-        run: zig build test -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="viewport eases" -Dtest-filter="command input" -Dtest-filter="unknown apc" -Dtest-filter=CursorGlide -Dtest-filter="manual:" -Dtest-filter="parse:"
+        run: zig build test -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="viewport eases" -Dtest-filter="command input" -Dtest-filter="unknown apc" -Dtest-filter=CursorGlide -Dtest-filter="manual:" -Dtest-filter="launch:" -Dtest-filter="parse:"
 
       # The tests do not compile the embedded apprt, which is the C API. A pull
       # request therefore also builds the library, as the build job does. It
