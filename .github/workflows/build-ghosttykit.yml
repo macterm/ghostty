@@ -23,7 +23,7 @@ on:
 # after a newer one would otherwise publish last and be marked latest. A queued
 # run of the same commit then finds its release already there and skips.
 # A pull request run is only a test, so a newer push cancels the older one,
-# also while it waits for a macOS runner. A run on main is never cancelled.
+# also while it waits for a macOS runner. A run on main that has started is never cancelled.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('build-ghosttykit-pr-{0}', github.ref) || 'build-ghosttykit' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
