@@ -68,10 +68,15 @@ jobs:
   # tests of the downstream patches run here, filtered to their names. The
   # build job needs this job, so a failure publishes nothing.
   test:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+
+      # zig cannot link with Xcode 26.4 or later (ziglang/zig#31658), and macos-26
+      # defaults to 26.6. Select an older Xcode of the image.
+      - name: Select Xcode 26.3
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
 
       # No version: setup-zig reads minimum_zig_version from build.zig.zon.
       - name: Install Zig
@@ -99,12 +104,17 @@ jobs:
   build:
     needs: [tag, test]
     if: needs.tag.outputs.exists == 'false'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
+
+      # zig cannot link with Xcode 26.4 or later (ziglang/zig#31658), and macos-26
+      # defaults to 26.6. Select an older Xcode of the image.
+      - name: Select Xcode 26.3
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
 
       # No version: setup-zig reads minimum_zig_version from build.zig.zon,
       # so the build follows the Zig that upstream requires. A pinned
