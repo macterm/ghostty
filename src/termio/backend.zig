@@ -11,28 +11,35 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
 /// The kinds of backends.
-pub const Kind = enum { exec };
+pub const Kind = enum { exec, manual };
 
 /// Configuration for the various backend types.
 pub const Config = union(Kind) {
     /// Exec uses posix exec to run a command with a pty.
     exec: termio.Exec.Config,
+
+    /// Manual has no pty: the embedder feeds bytes and receives writes
+    /// through callbacks.
+    manual: termio.Manual.Config,
 };
 
 /// Backend implementations. A backend is responsible for owning the pty
 /// behavior and providing read/write capabilities.
 pub const Backend = union(Kind) {
     exec: termio.Exec,
+    manual: termio.Manual,
 
     pub fn deinit(self: *Backend) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(),
+            .manual => |*manual| manual.deinit(),
         }
     }
 
     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
         switch (self.*) {
             .exec => |*exec| exec.initTerminal(t),
+            .manual => |*manual| manual.initTerminal(t),
         }
     }
 
@@ -44,12 +51,14 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.threadEnter(alloc, io, td),
+            .manual => |*manual| try manual.threadEnter(alloc, io, td),
         }
     }
 
     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
         switch (self.*) {
             .exec => |*exec| exec.threadExit(td),
+            .manual => |*manual| manual.threadExit(td),
         }
     }
 
@@ -60,6 +69,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.focusGained(td, focused),
+            .manual => |*manual| try manual.focusGained(td, focused),
         }
     }
 
@@ -70,6 +80,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.resize(grid_size, screen_size),
+            .manual => |*manual| try manual.resize(grid_size, screen_size),
         }
     }
 
@@ -82,6 +93,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
+            .manual => |*manual| try manual.queueWrite(alloc, td, data, linefeed),
         }
     }
 
@@ -108,6 +120,7 @@ pub const Backend = union(Kind) {
     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
         return switch (self.*) {
             .exec => |*exec| exec.getProcessInfo(info),
+            .manual => |*manual| manual.getProcessInfo(info),
         };
     }
 };
@@ -116,9 +129,13 @@ pub const Backend = union(Kind) {
 pub const ThreadData = union(Kind) {
     exec: termio.Exec.ThreadData,
 
+    /// The manual backend keeps no state on the termio thread.
+    manual: void,
+
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(alloc),
+            .manual => {},
         }
     }
 

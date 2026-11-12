@@ -61,6 +61,33 @@ saved_cursor: ?SavedCursor = null,
 /// automatically setup tracking.
 selection: ?Selection = null,
 
+/// Sub-row offset of the viewport in pixels, for smooth (pixel-precise)
+/// scrolling. Positive means the viewport sits that many pixels *above*
+/// its row-aligned position (content is drawn shifted down, revealing the
+/// bottom of the row above); negative means below. Always within one cell
+/// height. Any row-level viewport move resets it: the offset only ever
+/// describes the remainder of the scroll gesture that produced the current
+/// viewport, never a stale one. Rendering validates it against the screen
+/// (an offset pointing at a row that doesn't exist is drawn as zero).
+viewport_pixel_offset: f64 = 0,
+
+/// True while `viewport_pixel_offset` is a row-level move for the renderer
+/// to ease home, not the remainder of a wheel gesture: a keyboard move of
+/// the viewport under `smooth-scroll`, as copy mode makes when it scrolls
+/// to the selection head. The surface sets it with the offset. `scroll`
+/// and the scroll callback clear it, and the renderer clears it when the
+/// ease lands. Under `smooth-scroll-rows` every offset eases, flag or not.
+viewport_offset_eases: bool = false,
+
+/// Scrolls of a region of the alternate screen by whole rows that have
+/// happened since the renderer last looked (see `RegionScrolls`). With
+/// `smooth-scroll` on, the renderer animates them: the region's new
+/// content slides from where the old content was, and the rows that
+/// scrolled out slide away with it. A program that scrolls its own
+/// screen by rows, an editor say, gets the same continuous motion the
+/// scrollback viewport has, without knowing anything about pixels.
+region_scrolls: RegionScrolls = .{},
+
 /// The charset state
 charset: CharsetState = .{},
 
@@ -207,6 +234,56 @@ pub const Cursor = struct {
 };
 
 /// Saved cursor state.
+/// A scroll of a rectangle of the screen by whole rows: DECSTBM (and
+/// DECSLRM) margins scrolled by SU/SD or by IND/RI at the margin. `lines`
+/// is positive when the content moved up (SU), negative when it moved down,
+/// and is always smaller than the region's height: a scroll that keeps
+/// nothing is a clear and is not recorded.
+pub const RegionScroll = struct {
+    top: size.CellCountInt,
+    bottom: size.CellCountInt,
+    left: size.CellCountInt,
+    right: size.CellCountInt,
+    lines: i32,
+
+    pub fn sameRegion(a: RegionScroll, b: RegionScroll) bool {
+        return a.top == b.top and a.bottom == b.bottom and
+            a.left == b.left and a.right == b.right;
+    }
+};
+
+/// The region scrolls pending for the renderer. Scrolls of the same
+/// region merge, since between two frames only their sum can be seen,
+/// and a handful of distinct regions is plenty: a scroll of a region
+/// beyond that is simply not animated.
+pub const RegionScrolls = struct {
+    pub const capacity = 8;
+
+    items: [capacity]RegionScroll = undefined,
+    len: u8 = 0,
+
+    pub fn push(self: *RegionScrolls, region_scroll: RegionScroll) void {
+        if (region_scroll.lines == 0) return;
+        for (self.items[0..self.len]) |*existing| {
+            if (existing.sameRegion(region_scroll)) {
+                existing.lines += region_scroll.lines;
+                return;
+            }
+        }
+        if (self.len == capacity) return;
+        self.items[self.len] = region_scroll;
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const RegionScrolls) []const RegionScroll {
+        return self.items[0..self.len];
+    }
+
+    pub fn clear(self: *RegionScrolls) void {
+        self.len = 0;
+    }
+};
+
 pub const SavedCursor = struct {
     x: size.CellCountInt,
     y: size.CellCountInt,
@@ -1718,6 +1795,12 @@ pub const Scroll = union(enum) {
 /// Scroll the viewport of the terminal grid.
 pub inline fn scroll(self: *Screen, behavior: Scroll) void {
     defer self.assertIntegrity();
+
+    // A row-level move invalidates any sub-row remainder; the scroll
+    // callback re-publishes its own remainder after the move, and a
+    // keyboard move its own eased offset.
+    self.viewport_pixel_offset = 0;
+    self.viewport_offset_eases = false;
 
     if (comptime build_options.kitty_graphics) {
         // No matter what, scrolling marks our image state as dirty since
@@ -3639,6 +3722,36 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
     return .init(hl.start, hl.end, false);
 }
 
+/// The text the user typed at the latest prompt: the input cells of the
+/// prompt at or above the cursor, unwrapped, as one string (fork patch
+/// 0019). null when the shell never marked a prompt, when no prompt is
+/// above the cursor, or when the input has no text. Not trimmed: a
+/// leading space is the shells' `HISTCONTROL=ignorespace` sign, which the
+/// embedder reads. A continuation prompt between two input rows stays in
+/// the text, because the input zone spans it.
+///
+/// Read at OSC 133;C (the start of the output), while the input is still
+/// on the screen: a command that clears the screen, or that prints more
+/// than a screen, takes it away before 133;D. The caller owns the string.
+pub fn commandInputString(
+    self: *Screen,
+    alloc: Allocator,
+) Allocator.Error!?[:0]const u8 {
+    if (!self.semantic_prompt.seen) return null;
+    var it = self.cursor.page_pin.promptIterator(.left_up, null);
+    const prompt_pin = it.next() orelse return null;
+    const hl = self.pages.highlightSemanticContent(prompt_pin, .input) orelse return null;
+    const text = try self.selectionString(alloc, .{
+        .sel = .init(hl.start, hl.end, false),
+        .trim = false,
+    });
+    if (std.mem.trim(u8, text, " ").len == 0) {
+        alloc.free(text);
+        return null;
+    }
+    return text;
+}
+
 pub const LineIterator = struct {
     screen: *const Screen,
     current: ?Pin = null,
@@ -4071,6 +4184,17 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
             self.cursor.pending_wrap = true;
         }
     }
+}
+
+test "Screen viewport eases flag clears on a scroll" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    s.viewport_pixel_offset = 12;
+    s.viewport_offset_eases = true;
+    s.scroll(.{ .top = {} });
+    try testing.expectEqual(0, s.viewport_pixel_offset);
+    try testing.expect(!s.viewport_offset_eases);
 }
 
 test "Screen forwards optional scrollback limits" {
@@ -13104,5 +13228,53 @@ test "Screen: scrollClear cursor page pruned keeps per-page hyperlink id" {
     {
         const list_cell = s.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
         try testing.expect(list_cell.cell.hyperlink);
+    }
+}
+
+test "Screen: command input string" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // No prompt was ever marked: nothing.
+    try s.testWriteString("plain output\n");
+    try testing.expect((try s.commandInputString(alloc)) == null);
+
+    // A prompt, a typed command, then the output starts on the next row:
+    // the input alone, as typed, without the prompt. The spaces stay: a
+    // leading one is the shells' sign for a private command.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString(" make test  \n");
+    s.cursorSetSemanticContent(.output);
+    {
+        const text = (try s.commandInputString(alloc)).?;
+        defer alloc.free(text);
+        try testing.expectEqualStrings(" make test  ", text);
+    }
+
+    // Output, then a prompt with nothing typed: null, not the previous command.
+    try s.testWriteString("ok\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("\n");
+    s.cursorSetSemanticContent(.output);
+    try testing.expect((try s.commandInputString(alloc)) == null);
+
+    // A command that wraps onto a second row comes back unwrapped.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("echo 123456789012345678\n");
+    s.cursorSetSemanticContent(.output);
+    {
+        const text = (try s.commandInputString(alloc)).?;
+        defer alloc.free(text);
+        try testing.expectEqualStrings("echo 123456789012345678", text);
     }
 }
