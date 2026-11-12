@@ -22,9 +22,11 @@ on:
 # One build at a time, in the order they were pushed: a build that finished
 # after a newer one would otherwise publish last and be marked latest. A queued
 # run of the same commit then finds its release already there and skips.
+# A pull request run is only a test, so a newer push cancels the older one,
+# also while it waits for a macOS runner. A run on main that has started is never cancelled.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('build-ghosttykit-pr-{0}', github.ref) || 'build-ghosttykit' }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The release tag is a function of the commit alone —
@@ -66,7 +68,7 @@ jobs:
   # tests of the downstream patches run here, filtered to their names. The
   # build job needs this job, so a failure publishes nothing.
   test:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -97,7 +99,7 @@ jobs:
   build:
     needs: [tag, test]
     if: needs.tag.outputs.exists == 'false'
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 60
     permissions:
       contents: write
