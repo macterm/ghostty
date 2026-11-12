@@ -557,6 +557,16 @@ typedef struct {
   ghostty_surface_manual_resize_cb GHOSTTY_NULLABLE manual_resize;
 } ghostty_surface_config_s;
 
+// A resolved launch, see ghostty_launch_resolve.
+typedef struct {
+  const char* const* argv;
+  size_t argv_count;
+  const ghostty_env_var_s* env;
+  size_t env_count;
+  const char* GHOSTTY_NULLABLE cwd;
+  void* GHOSTTY_NULLABLE internal;
+} ghostty_launch_s;
+
 typedef struct {
   uint16_t columns;
   uint16_t rows;
@@ -1254,6 +1264,15 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Resolve what ghostty_surface_new would run in a pty for these options, and
+// start nothing: the command, the command wrapper, the login(1) wrapping of
+// macOS, the shell integration, the environment and the folder. For a manual
+// surface, whose host starts the process. Returns false on failure. Free the
+// result with ghostty_launch_free, one time, on the same struct (do not copy it).
+GHOSTTY_API bool ghostty_launch_resolve(ghostty_app_t,
+                                        const ghostty_surface_config_s*,
+                                        ghostty_launch_s*);
+GHOSTTY_API void ghostty_launch_free(ghostty_launch_s*);
 GHOSTTY_API void ghostty_surface_feed(ghostty_surface_t,
                                       const uint8_t*,
                                       uintptr_t);
