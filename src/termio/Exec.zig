@@ -60,6 +60,37 @@ pub fn deinit(self: *Exec) void {
     self.subprocess.deinit();
 }
 
+/// What `init` and `start` run, resolved and not started: the argv (with
+/// the command wrapper, the login(1) wrapping of macOS and the shell
+/// integration injected), the full environment and the folder. A host that
+/// starts the process itself (a manual surface runs no child) takes this
+/// from `resolveLaunch`.
+pub const Launch = struct {
+    arena: std.heap.ArenaAllocator,
+    args: []const [:0]const u8,
+    env: EnvMap,
+    cwd: ?[:0]const u8,
+
+    pub fn deinit(self: *Launch) void {
+        self.env.deinit();
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Resolve the launch that `init` and `start` would run, with no side
+/// effect: nothing is forked and no pty is opened. It runs the same code as
+/// `init` (`Subprocess.init`). Takes ownership of `cfg.env`, as `init` does.
+pub fn resolveLaunch(alloc: Allocator, cfg: Config) !Launch {
+    const subprocess = try Subprocess.init(alloc, cfg);
+    return .{
+        .arena = subprocess.arena,
+        .args = subprocess.args,
+        .env = subprocess.env.?,
+        .cwd = subprocess.cwd,
+    };
+}
+
 /// Call to initialize the terminal state as necessary for this backend.
 /// This is called before any termio begins. This should not be called
 /// after termio begins because it may put the internal terminal state
@@ -284,13 +315,15 @@ fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
     log.debug("child process exited status={} runtime={}ms", .{ exit_code, runtime_ms });
 
     // We always notify the surface immediately that the child has
-    // exited and some metadata about the exit.
+    // exited and some metadata about the exit. Not forever: this runs on
+    // the IO thread, which the app thread joins on teardown without
+    // draining its mailbox (renderer.State.closing).
     _ = td.surface_mailbox.push(.{
         .child_exited = .{
             .exit_code = exit_code,
             .runtime_ms = runtime_ms,
         },
-    }, .{ .forever = {} });
+    }, .{ .abort = &td.renderer_state.closing });
 }
 
 fn processExit(
@@ -379,10 +412,13 @@ fn termiosTimer(
 
         // We have to notify the surface that we're in password input.
         // We must block on this because the balanced true/false state
-        // of this is critical to apprt behavior.
+        // of this is critical to apprt behavior. A surface being torn
+        // down is the exception: its apprt state goes with it, and the
+        // app thread that would drain this is waiting on our exit
+        // (renderer.State.closing).
         _ = td.surface_mailbox.push(.{
             .password_input = password_input,
-        }, .{ .forever = {} });
+        }, .{ .abort = &td.renderer_state.closing });
     }
 
     // Repeat the timer
@@ -567,6 +603,7 @@ pub const ThreadData = struct {
 
 pub const Config = struct {
     command: ?configpkg.Command = null,
+    command_wrapper: ?configpkg.Command = null,
 
     /// The environment for the subprocess. init takes ownership of this
     /// whether or not it succeeds, so the caller must not free it after
@@ -827,7 +864,7 @@ const Subprocess = struct {
         }
 
         // Build our args list
-        const args: []const [:0]const u8 = execCommand(
+        const base_args: []const [:0]const u8 = execCommand(
             alloc,
             shell_command,
             internal_os.passwd,
@@ -851,6 +888,24 @@ const Subprocess = struct {
             // This logs on its own, this is a bad error.
             error.SystemError => return err,
         };
+
+        // If a command wrapper is configured, prepend its arguments to the
+        // resolved command so the resolved argv (including the macOS login(1)
+        // wrapping and any shell integration) runs as a child of the wrapper.
+        const args: []const [:0]const u8 = if (cfg.command_wrapper) |wrapper| wrap: {
+            var list: std.ArrayList([:0]const u8) = try .initCapacity(
+                alloc,
+                base_args.len + 4,
+            );
+            defer list.deinit(alloc);
+
+            var it = try wrapper.argIterator(alloc);
+            defer it.deinit();
+            while (it.next()) |arg| try list.append(alloc, try alloc.dupeSentinel(u8, arg, 0));
+
+            try list.appendSlice(alloc, base_args);
+            break :wrap try list.toOwnedSlice(alloc);
+        } else base_args;
 
         // We have to copy the cwd because there is no guarantee that
         // pointers in full_config remain valid.
@@ -2356,4 +2411,154 @@ test "init frees the env when it fails" {
         };
         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+/// Check that `resolveLaunch` gives what `init` gives for the same config:
+/// the same argv, the same env and the same folder. Both own an env, so the
+/// test builds one for each.
+fn expectSameLaunch(
+    alloc: Allocator,
+    cfg: *const configpkg.Config,
+    resources_dir: ?[]const u8,
+    command: ?configpkg.Command,
+    integration: configpkg.Config.ShellIntegration,
+) !Launch {
+    const testing = std.testing;
+
+    const make = struct {
+        fn env(a: Allocator) !EnvMap {
+            var e: EnvMap = .init(a);
+            errdefer e.deinit();
+            try e.put("HOME", "/home/ghostty");
+            try e.put("SHELL", "/bin/sh");
+            try e.put("PATH", "/usr/bin:/bin");
+            return e;
+        }
+    };
+
+    const base: Config = .{
+        .command = command,
+        .env = try make.env(alloc),
+        .shell_integration = integration,
+        .working_directory = "/tmp",
+        .resources_dir = resources_dir,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .init(cfg),
+        .rt_post_fork_info = .init(cfg),
+    };
+    var other = base;
+    other.env = try make.env(alloc);
+
+    var exec = try init(alloc, base);
+    defer exec.deinit();
+    var launch = try resolveLaunch(alloc, other);
+    errdefer launch.deinit();
+
+    const sub = &exec.subprocess;
+    try testing.expectEqual(sub.args.len, launch.args.len);
+    for (sub.args, launch.args) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expectEqualStrings("/tmp", launch.cwd.?);
+    try testing.expectEqualStrings(sub.cwd.?, launch.cwd.?);
+    try testing.expectEqual(sub.env.?.count(), launch.env.count());
+    var it = sub.env.?.iterator();
+    while (it.next()) |pair| {
+        try testing.expectEqualStrings(pair.value_ptr.*, launch.env.get(pair.key_ptr.*).?);
+    }
+
+    return launch;
+}
+
+fn launchResources(tmp: *std.testing.TmpDir) ![:0]const u8 {
+    for ([_][]const u8{ "bash", "zsh", "nushell", "fish", "elvish" }) |shell| {
+        var buf: [64]u8 = undefined;
+        try tmp.dir.createDirPath(
+            std.testing.io,
+            try std.mem.print(&buf, "shell-integration/{s}", .{shell}),
+        );
+    }
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "shell-integration/bash/ghostty.bash",
+        .data = "",
+    });
+    return tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+}
+
+test "launch: zsh gets its shell integration, as init gives it" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try launchResources(&tmp);
+    defer testing.allocator.free(dir);
+
+    var launch = try expectSameLaunch(testing.allocator, &config, dir, .{ .shell = "zsh" }, .detect);
+    defer launch.deinit();
+    try testing.expect(std.mem.endsWith(u8, launch.env.get("ZDOTDIR").?, "shell-integration/zsh"));
+    try testing.expectEqualStrings("ghostty", launch.env.get("TERM_PROGRAM").?);
+    try testing.expectEqualStrings(dir, launch.env.get("GHOSTTY_RESOURCES_DIR").?);
+    try testing.expectEqualStrings("truecolor", launch.env.get("COLORTERM").?);
+    try testing.expectEqualStrings("/tmp", launch.env.get("PWD").?);
+}
+
+test "launch: bash gets its shell integration, as init gives it" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try launchResources(&tmp);
+    defer testing.allocator.free(dir);
+
+    var launch = try expectSameLaunch(testing.allocator, &config, dir, .{ .shell = "bash" }, .detect);
+    defer launch.deinit();
+    try testing.expect(launch.env.get("GHOSTTY_SHELL_FEATURES") != null);
+    try testing.expectEqualStrings("1", launch.env.get("GHOSTTY_BASH_INJECT").?);
+    try testing.expect(std.mem.endsWith(u8, launch.env.get("ENV").?, "ghostty.bash"));
+    var has_posix = false;
+    for (launch.args) |arg| {
+        if (std.mem.indexOf(u8, arg, "--posix") != null) has_posix = true;
+    }
+    try testing.expect(has_posix);
+}
+
+test "launch: nushell gets its shell integration, as init gives it" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try launchResources(&tmp);
+    defer testing.allocator.free(dir);
+
+    var launch = try expectSameLaunch(testing.allocator, &config, dir, .{ .shell = "nu" }, .detect);
+    defer launch.deinit();
+    try testing.expect(std.mem.endsWith(
+        u8,
+        launch.env.get("GHOSTTY_SHELL_INTEGRATION_XDG_DIR").?,
+        "shell-integration",
+    ));
+    var found = false;
+    for (launch.args) |arg| {
+        if (std.mem.indexOf(u8, arg, "use ghostty *") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "launch: a plain command keeps its argv, as init gives it" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+
+    var launch = try expectSameLaunch(
+        testing.allocator,
+        &config,
+        null,
+        .{ .direct = &.{ "/bin/echo", "hello" } },
+        .none,
+    );
+    defer launch.deinit();
+    try testing.expect(launch.env.get("ZDOTDIR") == null);
+    try testing.expectEqualStrings("xterm-256color", launch.env.get("TERM").?);
+    try testing.expectEqualStrings("hello", launch.args[launch.args.len - 1]);
 }

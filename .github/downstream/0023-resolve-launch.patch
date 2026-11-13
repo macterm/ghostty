@@ -1,0 +1,448 @@
+From 198d1754216f846eb1d0c292609e7305a4e5e239 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Wed, 11 Nov 2026 11:57:33 -0500
+Subject: [PATCH] embedded: resolve a surface's launch (argv, env, folder) with
+ no process, so that a host that runs the child itself gets the shell
+ integration
+
+A manual surface runs no child, so libghostty no longer resolved the shell
+for it. ghostty_launch_resolve takes the options of ghostty_surface_new and
+returns what the exec backend would run: the command wrapper, the login(1)
+wrapping of macOS, the shell integration, TERM and the other variables of
+libghostty, the env of the config and the folder. It runs the code of
+Exec.init and starts nothing. ghostty_launch_free frees the result.
+---
+ include/ghostty.h      |  19 +++++
+ src/apprt/embedded.zig | 161 ++++++++++++++++++++++++++++++++----
+ src/termio/Exec.zig    | 181 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 343 insertions(+), 18 deletions(-)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index b1b740168..645f773b3 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -557,6 +557,16 @@ typedef struct {
+   ghostty_surface_manual_resize_cb GHOSTTY_NULLABLE manual_resize;
+ } ghostty_surface_config_s;
+ 
++// A resolved launch, see ghostty_launch_resolve.
++typedef struct {
++  const char* const* argv;
++  size_t argv_count;
++  const ghostty_env_var_s* env;
++  size_t env_count;
++  const char* GHOSTTY_NULLABLE cwd;
++  void* GHOSTTY_NULLABLE internal;
++} ghostty_launch_s;
++
+ typedef struct {
+   uint16_t columns;
+   uint16_t rows;
+@@ -1254,6 +1264,15 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
++// Resolve what ghostty_surface_new would run in a pty for these options, and
++// start nothing: the command, the command wrapper, the login(1) wrapping of
++// macOS, the shell integration, the environment and the folder. For a manual
++// surface, whose host starts the process. Returns false on failure. Free the
++// result with ghostty_launch_free, one time, on the same struct (do not copy it).
++GHOSTTY_API bool ghostty_launch_resolve(ghostty_app_t,
++                                        const ghostty_surface_config_s*,
++                                        ghostty_launch_s*);
++GHOSTTY_API void ghostty_launch_free(ghostty_launch_s*);
+ GHOSTTY_API void ghostty_surface_feed(ghostty_surface_t,
+                                       const uint8_t*,
+                                       uintptr_t);
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 90f6f90c3..14667cd15 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -573,6 +573,32 @@ pub const Surface = struct {
+         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
+         defer config.deinit();
+ 
++        try applyOptions(&config, opts);
++
++        // Initialize our surface right away. We're given a view that is
++        // ready to use.
++        try self.core_surface.init(
++            app.core_app.alloc,
++            &config,
++            app.core_app,
++            app,
++            self,
++        );
++        errdefer self.core_surface.deinit();
++
++        // If our options requested a specific font-size, set that.
++        if (opts.font_size != 0) {
++            var font_size = self.core_surface.font_size;
++            font_size.points = opts.font_size;
++            try self.core_surface.setFontSize(font_size);
++        }
++    }
++
++    /// Apply the options of a new surface to its config: the working
++    /// directory, command, command wrapper, shell integration, env and
++    /// initial input. `ghostty_launch_resolve` shares it with `init`, so that
++    /// both read the options in the same way.
++    fn applyOptions(config: *Config, opts: Options) !void {
+         // If we have a working directory from the options then we set it.
+         if (opts.working_directory) |c_wd| {
+             const wd = std.mem.sliceTo(c_wd, 0);
+@@ -680,24 +706,6 @@ pub const Surface = struct {
+         if (opts.wait_after_command) {
+             config.@"wait-after-command" = true;
+         }
+-
+-        // Initialize our surface right away. We're given a view that is
+-        // ready to use.
+-        try self.core_surface.init(
+-            app.core_app.alloc,
+-            &config,
+-            app.core_app,
+-            app,
+-            self,
+-        );
+-        errdefer self.core_surface.deinit();
+-
+-        // If our options requested a specific font-size, set that.
+-        if (opts.font_size != 0) {
+-            var font_size = self.core_surface.font_size;
+-            font_size.points = opts.font_size;
+-            try self.core_surface.setFontSize(font_size);
+-        }
+     }
+ 
+     pub fn deinit(self: *Surface) void {
+@@ -1288,6 +1296,13 @@ pub const Surface = struct {
+ 
+     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+         _ = self;
++        return defaultEnv();
++    }
++
++    /// The environment that a new surface starts from, before the options
++    /// and the shell integration. Not tied to a surface, so that
++    /// `ghostty_launch_resolve` can use it.
++    fn defaultEnv() !std.process.Environ.Map {
+         var env = try global.environMap();
+         errdefer env.deinit();
+ 
+@@ -1930,6 +1945,116 @@ pub const CAPI = struct {
+         return try app.newSurface(opts.*);
+     }
+ 
++    /// A resolved launch: what a surface with these options would run in
++    /// its pty. The fields are valid until `ghostty_launch_free`.
++    pub const Launch = extern struct {
++        /// The argv.
++        argv: [*]const [*:0]const u8,
++        argv_count: usize,
++
++        /// The full environment, as the child gets it.
++        env: [*]const EnvVar,
++        env_count: usize,
++
++        /// The working directory, or null for the one of the process.
++        cwd: ?[*:0]const u8,
++
++        /// Owned by libghostty. Do not touch.
++        internal: ?*anyopaque,
++    };
++
++    /// Resolve what `ghostty_surface_new` would run in a pty for these
++    /// options, and start nothing. It is the code of the exec backend before
++    /// its fork: the command, the command wrapper, the login(1) wrapping of
++    /// macOS, the shell integration, TERM and the other variables of
++    /// libghostty, the `env` of the config and the folder. The options are
++    /// read as `ghostty_surface_new` reads them (`manual_io` and the
++    /// callbacks are ignored). The environment starts from the one of the
++    /// process, as for a surface, without GHOSTTY_SURFACE_ID, which a surface
++    /// that does not exist yet has no value for. Returns false on failure.
++    export fn ghostty_launch_resolve(
++        app: *App,
++        opts: *const apprt.Surface.Options,
++        out: *Launch,
++    ) bool {
++        launch_resolve_(app, opts, out) catch |err| {
++            log.err("error resolving launch err={}", .{err});
++            return false;
++        };
++        return true;
++    }
++
++    fn launch_resolve_(
++        app: *App,
++        opts: *const apprt.Surface.Options,
++        out: *Launch,
++    ) !void {
++        const alloc = global.alloc();
++
++        var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
++        defer config.deinit();
++        try Surface.applyOptions(&config, opts.*);
++
++        // The result lives in the arena of the launch, which the C struct
++        // owns through this heap object. Do not copy the C struct before it
++        // is freed.
++        const holder = try alloc.create(termio.Exec.Launch);
++        errdefer alloc.destroy(holder);
++
++        var env = try Surface.defaultEnv();
++        _ = env.orderedRemove("GHOSTTY_LOG");
++
++        // Exec.resolveLaunch takes the env, also when it fails.
++        holder.* = try termio.Exec.resolveLaunch(alloc, .{
++            .command = config.command,
++            .command_wrapper = config.@"command-wrapper",
++            .env = env,
++            .env_override = config.env,
++            .shell_integration = config.@"shell-integration",
++            .shell_integration_features = config.@"shell-integration-features",
++            .cursor_blink = config.@"cursor-style-blink",
++            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
++            .resources_dir = global.resourcesDir().host(),
++            .term = config.term,
++            .rt_pre_exec_info = .init(&config),
++            .rt_post_fork_info = .init(&config),
++        });
++        errdefer holder.deinit();
++        const a = holder.arena.allocator();
++
++        const argv = try a.alloc([*:0]const u8, holder.args.len);
++        // Copy each argument: the command that Exec resolved can point into
++        // the config, which is freed when this function returns.
++        for (holder.args, 0..) |arg, i| argv[i] = (try a.dupeSentinel(u8, arg, 0)).ptr;
++
++        const vars = try a.alloc(EnvVar, holder.env.count());
++        var it = holder.env.iterator();
++        var i: usize = 0;
++        while (it.next()) |pair| : (i += 1) vars[i] = .{
++            .key = try a.dupeSentinel(u8, pair.key_ptr.*, 0),
++            .value = try a.dupeSentinel(u8, pair.value_ptr.*, 0),
++        };
++
++        out.* = .{
++            .argv = argv.ptr,
++            .argv_count = holder.args.len,
++            .env = vars.ptr,
++            .env_count = vars.len,
++            .cwd = if (holder.cwd) |cwd| cwd.ptr else null,
++            .internal = holder,
++        };
++    }
++
++    /// Free a launch from `ghostty_launch_resolve`. A second call does nothing.
++    export fn ghostty_launch_free(launch: *Launch) void {
++        const holder: *termio.Exec.Launch = @ptrCast(@alignCast(launch.internal orelse return));
++        holder.deinit();
++        global.alloc().destroy(holder);
++        launch.internal = null;
++        launch.argv_count = 0;
++        launch.env_count = 0;
++    }
++
+     export fn ghostty_surface_free(ptr: *Surface) void {
+         ptr.app.closeSurface(ptr);
+     }
+diff --git a/src/termio/Exec.zig b/src/termio/Exec.zig
+index ef5d35b44..929d66f77 100644
+--- a/src/termio/Exec.zig
++++ b/src/termio/Exec.zig
+@@ -60,6 +60,37 @@ pub fn deinit(self: *Exec) void {
+     self.subprocess.deinit();
+ }
+ 
++/// What `init` and `start` run, resolved and not started: the argv (with
++/// the command wrapper, the login(1) wrapping of macOS and the shell
++/// integration injected), the full environment and the folder. A host that
++/// starts the process itself (a manual surface runs no child) takes this
++/// from `resolveLaunch`.
++pub const Launch = struct {
++    arena: std.heap.ArenaAllocator,
++    args: []const [:0]const u8,
++    env: EnvMap,
++    cwd: ?[:0]const u8,
++
++    pub fn deinit(self: *Launch) void {
++        self.env.deinit();
++        self.arena.deinit();
++        self.* = undefined;
++    }
++};
++
++/// Resolve the launch that `init` and `start` would run, with no side
++/// effect: nothing is forked and no pty is opened. It runs the same code as
++/// `init` (`Subprocess.init`). Takes ownership of `cfg.env`, as `init` does.
++pub fn resolveLaunch(alloc: Allocator, cfg: Config) !Launch {
++    const subprocess = try Subprocess.init(alloc, cfg);
++    return .{
++        .arena = subprocess.arena,
++        .args = subprocess.args,
++        .env = subprocess.env.?,
++        .cwd = subprocess.cwd,
++    };
++}
++
+ /// Call to initialize the terminal state as necessary for this backend.
+ /// This is called before any termio begins. This should not be called
+ /// after termio begins because it may put the internal terminal state
+@@ -2381,3 +2412,153 @@ test "init frees the env when it fails" {
+         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+     }
+ }
++
++/// Check that `resolveLaunch` gives what `init` gives for the same config:
++/// the same argv, the same env and the same folder. Both own an env, so the
++/// test builds one for each.
++fn expectSameLaunch(
++    alloc: Allocator,
++    cfg: *const configpkg.Config,
++    resources_dir: ?[]const u8,
++    command: ?configpkg.Command,
++    integration: configpkg.Config.ShellIntegration,
++) !Launch {
++    const testing = std.testing;
++
++    const make = struct {
++        fn env(a: Allocator) !EnvMap {
++            var e: EnvMap = .init(a);
++            errdefer e.deinit();
++            try e.put("HOME", "/home/ghostty");
++            try e.put("SHELL", "/bin/sh");
++            try e.put("PATH", "/usr/bin:/bin");
++            return e;
++        }
++    };
++
++    const base: Config = .{
++        .command = command,
++        .env = try make.env(alloc),
++        .shell_integration = integration,
++        .working_directory = "/tmp",
++        .resources_dir = resources_dir,
++        .term = "xterm-ghostty",
++        .rt_pre_exec_info = .init(cfg),
++        .rt_post_fork_info = .init(cfg),
++    };
++    var other = base;
++    other.env = try make.env(alloc);
++
++    var exec = try init(alloc, base);
++    defer exec.deinit();
++    var launch = try resolveLaunch(alloc, other);
++    errdefer launch.deinit();
++
++    const sub = &exec.subprocess;
++    try testing.expectEqual(sub.args.len, launch.args.len);
++    for (sub.args, launch.args) |want, got| try testing.expectEqualStrings(want, got);
++    try testing.expectEqualStrings("/tmp", launch.cwd.?);
++    try testing.expectEqualStrings(sub.cwd.?, launch.cwd.?);
++    try testing.expectEqual(sub.env.?.count(), launch.env.count());
++    var it = sub.env.?.iterator();
++    while (it.next()) |pair| {
++        try testing.expectEqualStrings(pair.value_ptr.*, launch.env.get(pair.key_ptr.*).?);
++    }
++
++    return launch;
++}
++
++fn launchResources(tmp: *std.testing.TmpDir) ![:0]const u8 {
++    for ([_][]const u8{ "bash", "zsh", "nushell", "fish", "elvish" }) |shell| {
++        var buf: [64]u8 = undefined;
++        try tmp.dir.createDirPath(
++            std.testing.io,
++            try std.mem.print(&buf, "shell-integration/{s}", .{shell}),
++        );
++    }
++    try tmp.dir.writeFile(std.testing.io, .{
++        .sub_path = "shell-integration/bash/ghostty.bash",
++        .data = "",
++    });
++    return tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
++}
++
++test "launch: zsh gets its shell integration, as init gives it" {
++    const testing = std.testing;
++    var config = try configpkg.Config.default(testing.allocator);
++    defer config.deinit();
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const dir = try launchResources(&tmp);
++    defer testing.allocator.free(dir);
++
++    var launch = try expectSameLaunch(testing.allocator, &config, dir, .{ .shell = "zsh" }, .detect);
++    defer launch.deinit();
++    try testing.expect(std.mem.endsWith(u8, launch.env.get("ZDOTDIR").?, "shell-integration/zsh"));
++    try testing.expectEqualStrings("ghostty", launch.env.get("TERM_PROGRAM").?);
++    try testing.expectEqualStrings(dir, launch.env.get("GHOSTTY_RESOURCES_DIR").?);
++    try testing.expectEqualStrings("truecolor", launch.env.get("COLORTERM").?);
++    try testing.expectEqualStrings("/tmp", launch.env.get("PWD").?);
++}
++
++test "launch: bash gets its shell integration, as init gives it" {
++    const testing = std.testing;
++    var config = try configpkg.Config.default(testing.allocator);
++    defer config.deinit();
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const dir = try launchResources(&tmp);
++    defer testing.allocator.free(dir);
++
++    var launch = try expectSameLaunch(testing.allocator, &config, dir, .{ .shell = "bash" }, .detect);
++    defer launch.deinit();
++    try testing.expect(launch.env.get("GHOSTTY_SHELL_FEATURES") != null);
++    try testing.expectEqualStrings("1", launch.env.get("GHOSTTY_BASH_INJECT").?);
++    try testing.expect(std.mem.endsWith(u8, launch.env.get("ENV").?, "ghostty.bash"));
++    var has_posix = false;
++    for (launch.args) |arg| {
++        if (std.mem.indexOf(u8, arg, "--posix") != null) has_posix = true;
++    }
++    try testing.expect(has_posix);
++}
++
++test "launch: nushell gets its shell integration, as init gives it" {
++    const testing = std.testing;
++    var config = try configpkg.Config.default(testing.allocator);
++    defer config.deinit();
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const dir = try launchResources(&tmp);
++    defer testing.allocator.free(dir);
++
++    var launch = try expectSameLaunch(testing.allocator, &config, dir, .{ .shell = "nu" }, .detect);
++    defer launch.deinit();
++    try testing.expect(std.mem.endsWith(
++        u8,
++        launch.env.get("GHOSTTY_SHELL_INTEGRATION_XDG_DIR").?,
++        "shell-integration",
++    ));
++    var found = false;
++    for (launch.args) |arg| {
++        if (std.mem.indexOf(u8, arg, "use ghostty *") != null) found = true;
++    }
++    try testing.expect(found);
++}
++
++test "launch: a plain command keeps its argv, as init gives it" {
++    const testing = std.testing;
++    var config = try configpkg.Config.default(testing.allocator);
++    defer config.deinit();
++
++    var launch = try expectSameLaunch(
++        testing.allocator,
++        &config,
++        null,
++        .{ .direct = &.{ "/bin/echo", "hello" } },
++        .none,
++    );
++    defer launch.deinit();
++    try testing.expect(launch.env.get("ZDOTDIR") == null);
++    try testing.expectEqualStrings("xterm-256color", launch.env.get("TERM").?);
++    try testing.expectEqualStrings("hello", launch.args[launch.args.len - 1]);
++}
+-- 
+2.54.0 (Apple Git-157)
+

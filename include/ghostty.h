@@ -521,6 +521,19 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+// Manual surface callbacks, called on a libghostty IO thread. The data pointer
+// is valid only during the call. Either callback can run with the renderer
+// lock held, so neither may call ghostty_surface_feed or another function that
+// reads the terminal, or take a lock that a thread holds while it feeds.
+typedef void (*ghostty_surface_manual_write_cb)(void* GHOSTTY_NULLABLE,
+                                                const uint8_t*,
+                                                size_t);
+typedef void (*ghostty_surface_manual_resize_cb)(void* GHOSTTY_NULLABLE,
+                                                 uint16_t,
+                                                 uint16_t,
+                                                 uint32_t,
+                                                 uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -534,7 +547,25 @@ typedef struct {
   const char* GHOSTTY_NULLABLE initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  const char* GHOSTTY_NULLABLE const* GHOSTTY_NULLABLE command_wrapper;
+  size_t command_wrapper_count;
+  bool disable_shell_integration;
+  uint32_t initial_width_px;
+  uint32_t initial_height_px;
+  bool manual_io;
+  ghostty_surface_manual_write_cb GHOSTTY_NULLABLE manual_write;
+  ghostty_surface_manual_resize_cb GHOSTTY_NULLABLE manual_resize;
 } ghostty_surface_config_s;
+
+// A resolved launch, see ghostty_launch_resolve.
+typedef struct {
+  const char* const* argv;
+  size_t argv_count;
+  const ghostty_env_var_s* env;
+  size_t env_count;
+  const char* GHOSTTY_NULLABLE cwd;
+  void* GHOSTTY_NULLABLE internal;
+} ghostty_launch_s;
 
 typedef struct {
   uint16_t columns;
@@ -944,7 +975,20 @@ typedef struct {
   int16_t exit_code;
   // number of nanoseconds that command was running for
   uint64_t duration;
+  // the command as typed at the prompt (the OSC 133 input cells), or NULL
+  // when the shell marked no input. Valid for the action only.
+  const char* GHOSTTY_NULLABLE command;
 } ghostty_action_command_finished_s;
+
+// apprt.action.UnknownApc.C
+typedef struct {
+  // The APC payload between ESC _ and ST, without the framing. Not NUL
+  // terminated, and valid for the action only.
+  const char* data;
+  size_t len;
+  // true when the payload was cut at the capture limit.
+  bool truncated;
+} ghostty_action_unknown_apc_s;
 
 // apprt.action.StartSearch.C
 typedef struct {
@@ -1041,6 +1085,8 @@ typedef enum {
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
   GHOSTTY_ACTION_SET_WINDOW_THEME,
+  GHOSTTY_ACTION_OUTPUT_ACTIVITY,
+  GHOSTTY_ACTION_UNKNOWN_APC,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1056,6 +1102,7 @@ typedef union {
   ghostty_action_resize_window_s resize_window;
   ghostty_action_cell_size_s cell_size;
   ghostty_action_scrollbar_s scrollbar;
+  ghostty_action_scrollbar_s output_activity;
   ghostty_action_inspector_e inspector;
   ghostty_action_export_terminal_io_s export_terminal_io;
   ghostty_action_desktop_notification_s desktop_notification;
@@ -1080,6 +1127,7 @@ typedef union {
   ghostty_surface_message_childexited_s child_exited;
   ghostty_action_progress_report_s progress_report;
   ghostty_action_command_finished_s command_finished;
+  ghostty_action_unknown_apc_s unknown_apc;
   ghostty_action_start_search_s start_search;
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
@@ -1163,6 +1211,7 @@ typedef enum {
 // Published API
 
 GHOSTTY_API int ghostty_init(uintptr_t, char* GHOSTTY_NULLABLE* GHOSTTY_NONNULL);
+GHOSTTY_API void ghostty_sync_environ(void);
 GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);
@@ -1215,6 +1264,18 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Resolve what ghostty_surface_new would run in a pty for these options, and
+// start nothing: the command, the command wrapper, the login(1) wrapping of
+// macOS, the shell integration, the environment and the folder. For a manual
+// surface, whose host starts the process. Returns false on failure. Free the
+// result with ghostty_launch_free, one time, on the same struct (do not copy it).
+GHOSTTY_API bool ghostty_launch_resolve(ghostty_app_t,
+                                        const ghostty_surface_config_s*,
+                                        ghostty_launch_s*);
+GHOSTTY_API void ghostty_launch_free(ghostty_launch_s*);
+GHOSTTY_API void ghostty_surface_feed(ghostty_surface_t,
+                                      const uint8_t*,
+                                      uintptr_t);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
