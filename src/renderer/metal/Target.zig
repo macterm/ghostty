@@ -102,6 +102,15 @@ pub fn init(opts: Options) !Self {
     };
 }
 
+/// Let the system take the memory of this target (`true`), or keep it
+/// again (`false`). Set a target volatile only while it holds no frame
+/// that anything reads, and set it nonvolatile before a frame draws to it.
+/// A frame clears its target before it draws, so a target whose memory
+/// the system took loses nothing.
+pub fn setVolatile(self: *Self, v: bool) void {
+    _ = self.surface.setPurgeable(if (v) .@"volatile" else .non_volatile);
+}
+
 pub fn deinit(self: *Self) void {
     self.surface.deinit();
     self.texture.release();
