@@ -1,0 +1,527 @@
+From a03cbc1f6730642da3e7932dfe2b3215d9baa991 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Mon, 16 Nov 2026 22:49:42 -0500
+Subject: [PATCH] renderer: make idle render targets volatile on macOS
+
+A visible surface keeps three full-size render targets. On a 6K display
+one full-screen surface is 5588x3186 px, 68 MB for each target, and the
+three stay in memory while the surface is idle.
+
+When a target drew no frame for 1 s, the GPU completed its frame, it is
+not the target of the newest frame and the layer does not show it, the
+renderer makes its IOSurface volatile. Volatile memory does not count in
+the footprint of the process, and the system can take it when it needs
+memory. Before a frame draws to the target, the renderer makes it
+nonvolatile again. Each frame clears its target before it draws, so a
+target whose memory the system took loses nothing.
+
+The render thread marks the targets after each draw and with a timer at
+the time the next target can become idle. With a blinking cursor, which
+draws each 600 ms, one or two of the three targets stay volatile.
+
+The swap chain keeps three targets, because two targets make the CPU
+wait for the GPU at high refresh rates.
+---
+ pkg/macos/iosurface/iosurface.zig |  23 +++
+ src/renderer/Metal.zig            |   5 +-
+ src/renderer/Thread.zig           |  55 ++++++
+ src/renderer/generic.zig          | 266 ++++++++++++++++++++++++++++++
+ src/renderer/metal/Target.zig     |   9 +
+ 5 files changed, 357 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/macos/iosurface/iosurface.zig b/pkg/macos/iosurface/iosurface.zig
+index e5dea8369..6eebd7b96 100644
+--- a/pkg/macos/iosurface/iosurface.zig
++++ b/pkg/macos/iosurface/iosurface.zig
+@@ -83,6 +83,29 @@ pub const IOSurface = opaque {
+         );
+     }
+ 
++    /// The purgeable states of IOSurfaceSetPurgeable.
++    pub const Purgeable = enum(u32) {
++        /// The system keeps the memory.
++        non_volatile = 0,
++        /// The system can take the memory when it needs it. The
++        /// memory does not count in the footprint of the process.
++        @"volatile" = 1,
++        /// The system took the memory: the contents are gone.
++        empty = 2,
++        /// Do not change the state, only read it.
++        keep_current = 3,
++        _,
++    };
++
++    /// Set the purgeable state of the surface. Returns the state before
++    /// the call: `empty` tells that the system took the memory of a
++    /// volatile surface and its contents are gone.
++    pub fn setPurgeable(self: *IOSurface, state: Purgeable) Purgeable {
++        var old: u32 = 0;
++        _ = c.IOSurfaceSetPurgeable(@ptrCast(self), @backingInt(state), &old);
++        return @fromBackingInt(old);
++    }
++
+     pub inline fn lock(self: *IOSurface) void {
+         c.IOSurfaceLock(
+             @ptrCast(self),
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 440af56a3..d682ff7f9 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -236,7 +236,10 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
+ /// Which render target the layer is showing, as `targetIdentity` names
+ /// targets, or 0 before it shows one. The layer's contents only change on
+ /// the main thread, so read from there this is the frame on screen for
+-/// whatever else that thread does: the surface's hit tests.
++/// whatever else that thread does: the surface's hit tests. Read from the
++/// render thread, it is the target on screen at that time; the main
++/// thread can then only move the layer to a frame drawn after it, which
++/// `Renderer.markIdleTargets` never makes volatile.
+ pub fn shownTarget(self: *const Metal) usize {
+     const contents = self.layer.layer.msgSend(?*anyopaque, objc.sel("contents"), .{}) orelse return 0;
+     return @intFromPtr(contents);
+diff --git a/src/renderer/Thread.zig b/src/renderer/Thread.zig
+index 19d43f514..8a0748867 100644
+--- a/src/renderer/Thread.zig
++++ b/src/renderer/Thread.zig
+@@ -58,6 +58,13 @@ animation_wake: rendererpkg.Renderer.AnimationWake.Kind = .draw,
+ draw_now: xev.Async,
+ draw_now_c: xev.Completion = .{},
+ 
++/// The timer that makes idle render targets volatile (see
++/// `Renderer.markIdleTargets`). It runs after a draw, at the time a target
++/// can become idle.
++idle_h: xev.Timer,
++idle_c: xev.Completion = .{},
++idle_c_cancel: xev.Completion = .{},
++
+ /// The timer used for cursor blinking
+ cursor_h: xev.Timer,
+ cursor_c: xev.Completion = .{},
+@@ -144,6 +151,10 @@ pub fn init(
+     var cursor_timer = try xev.Timer.init();
+     errdefer cursor_timer.deinit();
+ 
++    // The timer for idle render targets.
++    var idle_h = try xev.Timer.init();
++    errdefer idle_h.deinit();
++
+     // The mailbox for messaging this thread
+     var mailbox = try Mailbox.create(alloc);
+     errdefer mailbox.destroy(alloc);
+@@ -157,6 +168,7 @@ pub fn init(
+         .render_h = render_h,
+         .draw_now = draw_now,
+         .cursor_h = cursor_timer,
++        .idle_h = idle_h,
+         .surface = surface,
+         .renderer = renderer_impl,
+         .state = state,
+@@ -180,6 +192,7 @@ pub fn deinit(self: *Thread) void {
+     self.render_h.deinit();
+     self.draw_now.deinit();
+     self.cursor_h.deinit();
++    self.idle_h.deinit();
+     if (comptime terminalpkg.compression_enabled)
+         self.compression.deinit();
+     self.loop.deinit();
+@@ -469,6 +482,48 @@ fn drawFrame(self: *Thread, now: bool) void {
+ 
+     self.renderer.drawFrame(false) catch |err|
+         log.warn("error drawing err={}", .{err});
++
++    self.armIdleTimer();
++}
++
++/// Make the render targets that became idle volatile, and run the idle
++/// timer again at the time the next target can become idle.
++fn armIdleTimer(self: *Thread) void {
++    const delay_ms = self.renderer.markIdleTargets() orelse return;
++    self.idle_h.reset(
++        &self.loop,
++        &self.idle_c,
++        &self.idle_c_cancel,
++        delay_ms,
++        Thread,
++        self,
++        idleTimerCallback,
++    );
++}
++
++fn idleTimerCallback(
++    self_: ?*Thread,
++    _: *xev.Loop,
++    _: *xev.Completion,
++    r: xev.Timer.RunError!void,
++) xev.CallbackAction {
++    _ = r catch |err| switch (err) {
++        // A draw ran the timer again (Timer.reset cancels the pending
++        // run). The new run carries on.
++        error.Canceled => return .disarm,
++        else => {
++            log.warn("error in idle target timer err={}", .{err});
++            return .disarm;
++        },
++    };
++    const t = self_ orelse return .disarm;
++
++    // A surface that is not visible has no swap chain (setVisible
++    // releases it), so there is nothing to mark.
++    if (!t.flags.visible) return .disarm;
++
++    t.armIdleTimer();
++    return .disarm;
+ }
+ 
+ fn wakeupCallback(
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 2e7f55e16..6b9a8cac5 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -625,6 +625,91 @@ fn PresentedRegions(comptime slots: usize) type {
+     };
+ }
+ 
++/// The render targets of the swap chain that hold no frame that anything
++/// reads, so the system can take their memory (on macOS, a volatile
++/// IOSurface). Each target is a full-size frame: on a 6K display a
++/// full-screen surface keeps three targets of 68 MB each. While the
++/// surface is idle, only the target on screen holds a frame that
++/// something reads (Core Animation, and an embedder that reads the layer).
++///
++/// A target is idle when it drew no frame for `idle_ns`, it is not the
++/// target of the newest frame, the GPU completed its frame, and the layer
++/// does not show it. A frame clears its target before it draws, so a draw
++/// to an idle target only has to make it nonvolatile again (`draw`).
++///
++/// A blinking cursor draws a frame about each 600 ms, round the slots, so
++/// each slot draws each 1.8 s: one or two slots stay idle between draws.
++fn IdleTargets(comptime slots: usize) type {
++    return struct {
++        const Self = @This();
++
++        /// A target that drew no frame for this long can be idle.
++        pub const idle_ns: u64 = std.time.ns_per_s;
++
++        /// When each slot last drew a frame, in nanoseconds on the awake
++        /// clock, or null when it drew no frame.
++        drawn_at: [slots]?u64 = @splat(null),
++        /// The slots that are idle (volatile) now.
++        idle: [slots]bool = @splat(false),
++        /// The slot of the newest frame, or null before the first frame.
++        last: ?usize = null,
++
++        pub const Mark = struct {
++            /// The slots to make volatile now.
++            idle: [slots]bool = @splat(false),
++            /// Nanoseconds until `mark` can find another idle slot, or null
++            /// when no slot can become idle until a frame draws.
++            next_ns: ?u64 = null,
++        };
++
++        /// A frame draws to `slot` at `now`. Returns true when the slot was
++        /// idle: make its target nonvolatile before the frame draws.
++        pub fn draw(self: *Self, slot: usize, now: u64) bool {
++            const was_idle = self.idle[slot];
++            self.idle[slot] = false;
++            self.drawn_at[slot] = now;
++            self.last = slot;
++            return was_idle;
++        }
++
++        /// Find the slots that become idle at `now` and record them as idle.
++        /// `shown` is the slot of the target that the layer shows, or null
++        /// when the layer shows no target of this swap chain. `in_flight` is
++        /// the count of frames that the GPU did not complete. Frames complete
++        /// in the order they draw, so these are the newest frames.
++        pub fn mark(self: *Self, now: u64, shown: ?usize, in_flight: usize) Mark {
++            var result: Mark = .{};
++            const last = self.last orelse return result;
++            for (0..slots) |slot| {
++                if (self.idle[slot]) continue;
++                if (shown == slot) continue;
++                const drawn_at = self.drawn_at[slot] orelse continue;
++
++                // How many frames drew after the frame of this slot. The
++                // newest frame is 0. Slots draw in turn.
++                const age = (last + slots - slot) % slots;
++                if (age == 0) continue;
++
++                const deadline = drawn_at + idle_ns;
++                const wait: u64 = if (now < deadline)
++                    // Not idle for long enough yet.
++                    deadline - now
++                else if (age < in_flight)
++                    // The GPU still draws this frame. This is not
++                    // expected after `idle_ns`; try again later.
++                    idle_ns
++                else {
++                    self.idle[slot] = true;
++                    result.idle[slot] = true;
++                    continue;
++                };
++                result.next_ns = @min(result.next_ns orelse wait, wait);
++            }
++            return result;
++        }
++    };
++}
++
+ /// Create a renderer type with the provided graphics API wrapper.
+ ///
+ /// The graphics API wrapper must provide the interface outlined below.
+@@ -780,6 +865,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         /// `regionShifts`).
+         presented_regions: PresentedRegions(SwapChain.buf_count) = .{},
+ 
++        /// The render targets that the system can take the memory of
++        /// while the surface is idle (see `IdleTargets`). Used only where
++        /// the graphics API has volatile targets (`purgeable_targets`).
++        idle_targets: IdleTargets(SwapChain.buf_count) = .{},
++
+         /// The focused cursor's motion under `smooth-cursor` or
+         /// `cursor-trail` (see `CursorGlide`): null until a cursor has been
+         /// placed, and whether this frame's cells put a cursor there for
+@@ -928,6 +1018,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             /// Semaphore that we wait on to make sure we have an available
+             /// frame state struct so we can start working on a new frame.
+             frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
++            /// The count of frames that are drawing: from `nextFrame` to
++            /// `releaseFrame`. The GPU completion handler releases frames,
++            /// so this is atomic.
++            in_flight: std.atomic.Value(usize) = .init(0),
+ 
+             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
+                 var result: SwapChain = .{ .frames = undefined };
+@@ -954,12 +1048,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             /// always be paired with a call to releaseFrame.
+             pub fn nextFrame(self: *SwapChain) *FrameState {
+                 self.frame_sema.waitUncancelable(global.io());
++                _ = self.in_flight.fetchAdd(1, .acq_rel);
+                 self.frame_index = (self.frame_index + 1) % buf_count;
+                 return &self.frames[self.frame_index];
+             }
+ 
+             /// This should be called when the frame has completed drawing.
+             pub fn releaseFrame(self: *SwapChain) void {
++                _ = self.in_flight.fetchSub(1, .acq_rel);
+                 self.frame_sema.post(global.io());
+             }
+         };
+@@ -2258,6 +2354,55 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             return self.presented_regions.get(global.io(), shown);
+         }
+ 
++        /// True when the graphics API can let the system take the memory of
++        /// a render target (`Target.setVolatile`) and can say which target
++        /// the layer shows (`shownTarget`). See `IdleTargets`.
++        const purgeable_targets =
++            @hasDecl(Target, "setVolatile") and
++            @hasDecl(GraphicsAPI, "shownTarget") and
++            @hasDecl(GraphicsAPI, "targetIdentity");
++
++        fn awakeNanoseconds() u64 {
++            const now: std.Io.Timestamp = .now(global.io(), .awake);
++            return @intCast(now.nanoseconds);
++        }
++
++        /// Make volatile the render targets that hold no frame that
++        /// anything reads, so the system can take their memory while the
++        /// surface is idle (see `IdleTargets`). The next frame that draws
++        /// to such a target makes it nonvolatile again.
++        ///
++        /// Returns the milliseconds until a call can find another idle
++        /// target, or null when no target can become idle until a frame
++        /// draws. Must be called on the render thread.
++        pub fn markIdleTargets(self: *Self) ?u64 {
++            if (comptime !purgeable_targets) return null;
++
++            self.draw_mutex.lockUncancelable(global.io());
++            defer self.draw_mutex.unlock(global.io());
++
++            const swap_chain = if (self.swap_chain) |*sc| sc else return null;
++
++            // Never the target on the layer: Core Animation shows it, and an
++            // embedder can read it (for a preview or a capture).
++            const shown = self.api.shownTarget();
++            const shown_slot: ?usize = for (&swap_chain.frames, 0..) |*frame, i| {
++                if (shown != 0 and GraphicsAPI.targetIdentity(&frame.target) == shown) break i;
++            } else null;
++
++            const result = self.idle_targets.mark(
++                awakeNanoseconds(),
++                shown_slot,
++                swap_chain.in_flight.load(.acquire),
++            );
++            for (result.idle, &swap_chain.frames) |idle, *frame| {
++                if (idle) frame.target.setVolatile(true);
++            }
++
++            const ns = result.next_ns orelse return null;
++            return ns / std.time.ns_per_ms + 1;
++        }
++
+         /// Called by the graphics API once it has presented the frame drawn
+         /// to `target`. Where it can't say which target it is showing, the
+         /// hit test undoes this frame's region offsets from here on.
+@@ -2923,6 +3068,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                         self.api,
+                         self.has_custom_shaders,
+                     );
++                    // New targets are nonvolatile and drew no frame.
++                    self.idle_targets = .{};
+                     break :rebuild .{ &self.swap_chain.?, true };
+                 };
+ 
+@@ -3009,6 +3156,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 frame.target_config_modified = self.target_config_modified;
+             }
+ 
++            // An idle target can have lost its memory. This frame clears
++            // the target before it draws, so only keep the memory again.
++            if (comptime purgeable_targets) {
++                if (self.idle_targets.draw(
++                    swap_chain.frame_index,
++                    awakeNanoseconds(),
++                )) frame.target.setVolatile(false);
++            }
++
+             // Upload images to the GPU as necessary.
+             _ = self.images.upload(self.alloc, &self.api);
+ 
+@@ -5101,3 +5257,113 @@ test "PresentedRegions answers with the offsets of the frame on screen" {
+     try testing.expectEqual(0, offset(&regions, 103));
+     try testing.expectEqual(0, offset(&regions, 0));
+ }
++
++test "IdleTargets makes volatile the slots that drew nothing for a second" {
++    const testing = std.testing;
++    const ms = std.time.ns_per_ms;
++    var idle: IdleTargets(3) = .{};
++
++    // No frame drew: no slot can become idle.
++    try testing.expectEqual(null, idle.mark(0, null, 0).next_ns);
++
++    // Three frames draw in turn, 10 ms apart. The layer shows the newest.
++    try testing.expect(!idle.draw(0, 0));
++    try testing.expect(!idle.draw(1, 10 * ms));
++    try testing.expect(!idle.draw(2, 20 * ms));
++
++    // Before a second passes no slot is idle. The next check is when
++    // slot 0 has drawn nothing for a second.
++    var m = idle.mark(500 * ms, 2, 0);
++    try testing.expectEqual([3]bool{ false, false, false }, m.idle);
++    try testing.expectEqual(500 * ms, m.next_ns.?);
++
++    // At 1 s slot 0 is idle; slot 1 follows 10 ms later.
++    m = idle.mark(1000 * ms, 2, 0);
++    try testing.expectEqual([3]bool{ true, false, false }, m.idle);
++    try testing.expectEqual(10 * ms, m.next_ns.?);
++    m = idle.mark(1010 * ms, 2, 0);
++    try testing.expectEqual([3]bool{ false, true, false }, m.idle);
++
++    // The slot of the newest frame, on screen, never becomes idle, and
++    // nothing is left to wait for.
++    m = idle.mark(60_000 * ms, 2, 0);
++    try testing.expectEqual([3]bool{ false, false, false }, m.idle);
++    try testing.expectEqual(null, m.next_ns);
++    try testing.expectEqual([3]bool{ true, true, false }, idle.idle);
++
++    // A draw to an idle slot makes it nonvolatile again, once.
++    try testing.expect(idle.draw(0, 61_000 * ms));
++    try testing.expectEqual([3]bool{ false, true, false }, idle.idle);
++    try testing.expect(idle.draw(1, 61_010 * ms));
++    try testing.expectEqual([3]bool{ false, false, false }, idle.idle);
++}
++
++test "IdleTargets never makes volatile the slot on screen" {
++    const testing = std.testing;
++    const ms = std.time.ns_per_ms;
++    var idle: IdleTargets(3) = .{};
++
++    _ = idle.draw(0, 0);
++    _ = idle.draw(1, 10 * ms);
++
++    // The layer did not take the newest frame (it was the wrong size), so
++    // it still shows slot 0. Slot 0 stays, and the newest stays too.
++    const m = idle.mark(10_000 * ms, 0, 0);
++    try testing.expectEqual([3]bool{ false, false, false }, m.idle);
++    try testing.expectEqual(null, m.next_ns);
++
++    // Once the layer shows slot 1, slot 0 becomes idle.
++    try testing.expectEqual(
++        [3]bool{ true, false, false },
++        idle.mark(10_000 * ms, 1, 0).idle,
++    );
++}
++
++test "IdleTargets waits for the GPU to complete a frame" {
++    const testing = std.testing;
++    const ms = std.time.ns_per_ms;
++    var idle: IdleTargets(3) = .{};
++
++    _ = idle.draw(0, 0);
++    _ = idle.draw(1, 10 * ms);
++    _ = idle.draw(2, 20 * ms);
++
++    // Two frames are in flight: the newest (slot 2) and slot 1. Slot 0 is
++    // complete; slot 1 is tried again later.
++    var m = idle.mark(5_000 * ms, null, 2);
++    try testing.expectEqual([3]bool{ true, false, false }, m.idle);
++    try testing.expectEqual(IdleTargets(3).idle_ns, m.next_ns.?);
++
++    m = idle.mark(6_000 * ms, null, 1);
++    try testing.expectEqual([3]bool{ false, true, false }, m.idle);
++}
++
++test "IdleTargets frees one slot under a blinking cursor" {
++    const testing = std.testing;
++    const ms = std.time.ns_per_ms;
++    var idle: IdleTargets(3) = .{};
++
++    // A cursor blinks each 600 ms; each frame draws to the next slot. Mark
++    // after each draw, as the render thread does, and at each deadline.
++    var t: u64 = 0;
++    var slot: usize = 0;
++    var volatile_after_draw: usize = 0;
++    var draws: usize = 0;
++    while (t < 20_000 * ms) : (t += 100 * ms) {
++        if (t % (600 * ms) == 0) {
++            _ = idle.draw(slot, t);
++            _ = idle.mark(t, slot, 1);
++            if (t >= 3_000 * ms) {
++                draws += 1;
++                for (idle.idle) |v| volatile_after_draw += @intFromBool(v);
++            }
++            slot = (slot + 1) % 3;
++        } else _ = idle.mark(t, (slot + 2) % 3, 0);
++
++        // The slot of the newest frame is never idle.
++        try testing.expect(!idle.idle[(slot + 2) % 3]);
++    }
++
++    // After each draw at least one of the two other slots is volatile.
++    try testing.expect(volatile_after_draw >= draws);
++}
+diff --git a/src/renderer/metal/Target.zig b/src/renderer/metal/Target.zig
+index cac831ed5..66b7e8a44 100644
+--- a/src/renderer/metal/Target.zig
++++ b/src/renderer/metal/Target.zig
+@@ -102,6 +102,15 @@ pub fn init(opts: Options) !Self {
+     };
+ }
+ 
++/// Let the system take the memory of this target (`true`), or keep it
++/// again (`false`). Set a target volatile only while it holds no frame
++/// that anything reads, and set it nonvolatile before a frame draws to it.
++/// A frame clears its target before it draws, so a target whose memory
++/// the system took loses nothing.
++pub fn setVolatile(self: *Self, v: bool) void {
++    _ = self.surface.setPurgeable(if (v) .@"volatile" else .non_volatile);
++}
++
+ pub fn deinit(self: *Self) void {
+     self.surface.deinit();
+     self.texture.release();
+-- 
+2.54.0 (Apple Git-157)
+
