@@ -1264,6 +1264,18 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Zoom the picture of the surface, as a pinch zooms a page: scale about the
+// anchor point, then move by the pan. The anchor and the pan are in the units
+// of ghostty_surface_mouse_pos. A scale of 1 is no zoom. The scale is clamped
+// to 1 through 3, and the pan so that the picture covers the surface. The
+// font size, the grid and the pty size do not change. Mouse positions and
+// ghostty_surface_ime_point follow the zoom.
+GHOSTTY_API void ghostty_surface_set_zoom(ghostty_surface_t,
+                                          double scale,
+                                          double anchor_x,
+                                          double anchor_y,
+                                          double pan_x,
+                                          double pan_y);
 // Resolve what ghostty_surface_new would run in a pty for these options, and
 // start nothing: the command, the command wrapper, the login(1) wrapping of
 // macOS, the shell integration, the environment and the folder. For a manual

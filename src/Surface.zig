@@ -1317,7 +1317,7 @@ fn selectionScrollTick(self: *Surface) !void {
 
     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
         .viewport = pos_vp,
-        .xpos = pos.x,
+        .xpos = self.zoom().inverse(pos.x, pos.y).x,
         .ypos = pos.y,
         .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
         .word_boundary_codepoints = self.config.selection_word_chars,
@@ -2298,6 +2298,8 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
     // a region scroll animation shifts the cursor's region further still.
     const shift = self.viewportPixelShift() +
         self.regionShifts().offsetAt(cursor.x, cursor.y);
+    // The zoom applies last, as the picture is drawn.
+    const z = self.zoom();
     self.renderer_state.mutex.unlock(global.io());
 
     // TODO: need to handle when scrolling and the cursor is not
@@ -2311,6 +2313,9 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
 
         // We want the midpoint
         x += @as(f64, @floatFromInt(self.size.cell.width)) / 2;
+
+        // Where the zoomed picture draws it
+        x = z.forward(x, 0).x;
 
         // And scale it
         x /= scale.x;
@@ -2328,6 +2333,9 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
         // Of the row as it is drawn
         y += shift;
 
+        // Where the zoomed picture draws it
+        y = z.forward(0, y).y;
+
         // And scale it
         y /= scale.y;
 
@@ -2338,6 +2346,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
     // rendering only renders in a single line.
     const height: f64 = height: {
         var height: f64 = @floatFromInt(self.size.cell.height);
+        height *= z.scale;
         height /= scale.y;
         break :height height;
     };
@@ -2357,7 +2366,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
         // that is so I'm going to just leave this comment here so its known
         // that I left this out on purpose pending more investigation.
 
-        break :width width;
+        break :width width * z.scale;
     };
 
     return .{
@@ -4005,10 +4014,7 @@ fn mouseReport(
         .button = button,
         .action = action,
         .mods = mods,
-        .pos = .{
-            .x = pos.x,
-            .y = self.mouseReportY(pos.x, pos.y),
-        },
+        .pos = self.mouseReportPos(pos),
     }, encoding_opts) catch |err| switch (err) {
         error.WriteFailed => {
             // This should never happen since mouse events should never
@@ -4268,8 +4274,8 @@ pub fn mouseButtonCallback(
         var press_selection = try self.mouse.selection_gesture.press(t, .{
             .time = std.Io.Timestamp.now(global.io(), .awake),
             .pin = pin,
-            .xpos = pos.x,
-            .ypos = pos.y,
+            .xpos = self.zoom().inverse(pos.x, pos.y).x,
+            .ypos = self.zoom().inverse(pos.x, pos.y).y,
             .max_distance = @floatFromInt(self.size.cell.width),
             .repeat_interval = self.config.mouse_interval,
             .word_boundary_codepoints = self.config.selection_word_chars,
@@ -4970,7 +4976,7 @@ pub fn cursorPosCallback(
         // Perform our drag behavior in our gesture handler.
         const drag_selection = self.mouse.selection_gesture.drag(t, .{
             .pin = pin,
-            .xpos = pos.x,
+            .xpos = self.zoom().inverse(pos.x, pos.y).x,
             .ypos = pos.y,
             .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
             .word_boundary_codepoints = self.config.selection_word_chars,
@@ -5030,6 +5036,15 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 ///
 /// Precondition: the render_state mutex must be held.
 pub fn posToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
+    const base = self.zoom().inverse(xpos, ypos);
+    return self.basePosToViewport(base.x, base.y);
+}
+
+/// `posToViewport` for a point in base surface pixels, with the zoom
+/// already undone.
+///
+/// Precondition: the render_state mutex must be held.
+fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
     // Smooth scrolling draws the viewport shifted by a sub-row offset, and
     // a region scroll animation draws its region's content further off
     // still; undo both so the hit-tested cell is the one under the pointer.
@@ -5040,6 +5055,33 @@ pub fn posToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
     const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = y } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
+}
+
+/// The zoom of the picture (`renderer.Zoom`), resolved for the surface's
+/// size. Every pointer becomes a cell through its inverse in
+/// `posToViewport` (and `posToPin`, `mouseReportPos`), and the IME point
+/// goes through its forward in `imePointScaled`. A selection also gets
+/// the pointer's x through the inverse, for the half of the cell it is
+/// on, and keeps its y on screen, so a drag past the surface's edge
+/// still scrolls.
+///
+/// Precondition: the render_state mutex must be held.
+fn zoom(self: *const Surface) rendererpkg.Zoom {
+    return self.renderer_state.zoom.resolve(
+        @floatFromInt(self.size.screen.width),
+        @floatFromInt(self.size.screen.height),
+    );
+}
+
+/// Set the zoom of the picture, in surface pixels: `scale` about the
+/// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
+/// A scale of 1 is no zoom. The values are kept as given and clamped
+/// at each use (`renderer.Zoom.resolve`). The font size, the grid and
+/// the pty size do not change.
+pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.zoom = request;
 }
 
 /// How far below its row-aligned position the renderer draws the
@@ -5089,9 +5131,10 @@ fn viewportShift(self: *const Surface) terminal.RenderState.Shift {
 /// Precondition: the render_state mutex must be held.
 fn posToPin(self: *Surface, xpos: f64, ypos: f64) ?terminal.Pin {
     const screen: *terminal.Screen = self.io.terminal.screens.active;
-    const pt = self.posToViewport(xpos, ypos);
+    const base = self.zoom().inverse(xpos, ypos);
+    const pt = self.basePosToViewport(base.x, base.y);
     const above = self.viewportShift().rowsAboveAt(
-        ypos - @as(f64, @floatFromInt(self.size.padding.top)),
+        base.y - @as(f64, @floatFromInt(self.size.padding.top)),
         @floatFromInt(self.size.cell.height),
     );
     if (above == 0) return screen.pages.pin(.{ .viewport = pt });
@@ -5144,19 +5187,28 @@ fn regionContentY(self: *Surface, xpos: f64, ypos: f64) f64 {
     ) + top;
 }
 
-/// The pointer's y for a mouse report: where it falls on the grid as drawn
-/// (see `viewportPixelShift` and `regionContentY`), so a program is told
-/// the cell the user clicked. A pointer outside the surface is left alone
-/// and one inside is kept inside, so whether an event happened outside the
-/// viewport is still decided by where the pointer really is.
+/// The pointer for a mouse report: where it falls on the grid as drawn
+/// (see `zoom`, `viewportPixelShift` and `regionContentY`), so a program
+/// is told the cell the user clicked. On each axis, a pointer outside the
+/// surface is left alone and one inside is kept inside, so whether an
+/// event happened outside the viewport is still decided by where the
+/// pointer really is.
 ///
 /// Precondition: the render_state mutex must be held.
-fn mouseReportY(self: *Surface, xpos: f32, ypos: f32) f32 {
+fn mouseReportPos(self: *Surface, pos: apprt.CursorPos) apprt.CursorPos {
+    const width: f32 = @floatFromInt(self.size.screen.width);
     const height: f32 = @floatFromInt(self.size.screen.height);
-    if (ypos < 0 or ypos > height) return ypos;
-    const shift = self.viewportPixelShift();
-    const y: f32 = @floatCast(self.regionContentY(xpos, @as(f64, ypos) - shift));
-    return std.math.clamp(y, 0, height);
+    const base = self.zoom().inverse(pos.x, pos.y);
+    const x: f32 = if (pos.x < 0 or pos.x > width)
+        pos.x
+    else
+        std.math.clamp(@as(f32, @floatCast(base.x)), 0, width);
+    const y: f32 = if (pos.y < 0 or pos.y > height) pos.y else y: {
+        const shift = self.viewportPixelShift();
+        const content: f32 = @floatCast(self.regionContentY(x, base.y - shift));
+        break :y std.math.clamp(content, 0, height);
+    };
+    return .{ .x = x, .y = y };
 }
 
 /// Scroll to the bottom of the viewport.
