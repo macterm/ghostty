@@ -1,11 +1,10 @@
-From 2126e1009e43ab12f46dca3602d0bdcf094dc1a2 Mon Sep 17 00:00:00 2001
+From 34e22b1f97de24577a3fd54c1cdb822bc5fa6dfa Mon Sep 17 00:00:00 2001
 From: Ethan Lee <ethantlee21@gmail.com>
-Date: Wed, 18 Nov 2026 01:03:09 -0500
+Date: Wed, 18 Nov 2026 01:03:23 -0500
 Subject: [PATCH] surface: zoom the picture of a surface, with no change to the
  grid
 
-A pinch in Macterm zooms the picture of a pane, as a pinch zooms a page
-in a browser. The font size, the grid and the pty size must not change,
+A pinch in Macterm zooms the picture of a pane. The font size, the grid and the pty size must not change,
 so the zoom is a view transform: scale about an anchor point, then a
 pan. Every other position stays in base surface pixels, and the zoom
 applies last.
@@ -19,8 +18,9 @@ update.
 
 The surface applies the inverse where a pointer becomes a cell
 (posToViewport, posToPin, mouse reports, the x of a selection) and the
-forward in imePointScaled, so each popover that anchors to the cursor
-follows the zoom. ghostty_surface_set_zoom sets the request, in points.
+forward where a cell becomes a point for the host (imePointScaled and
+the text point of dumpTextLocked), so the IME window, Quick Look and
+the popovers that anchor to these points follow the zoom. ghostty_surface_set_zoom sets the request, in points.
 
 The renderer does not draw the zoom yet.
 ---
