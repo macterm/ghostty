@@ -89,8 +89,7 @@ jobs:
       # targets that become volatile while the surface is idle). "pane zoom"
       # covers patch 0025 (the zoom of a surface's picture).
       #
-      # The seed is fixed here so that the next step can run a crashed shard
-      # again with the same seed. The build runner gives each test the seed.
+      # The seed is set here so that the next step can use it again.
       - name: Test downstream patches
         id: tests
         shell: bash
@@ -99,15 +98,10 @@ jobs:
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
           zig build test --seed="$seed" -Dsentry=false -Dtest-filter=Selection -Dtest-filter="selection head" -Dtest-filter="viewport eases" -Dtest-filter="command input" -Dtest-filter="unknown apc" -Dtest-filter=CursorGlide -Dtest-filter="manual:" -Dtest-filter="launch:" -Dtest-filter="parse:" -Dtest-filter=IdleTargets -Dtest-filter="pane zoom" 2>&1 | tee "$RUNNER_TEMP/test.log"
 
-      # When a test crashes, the build runner names it ("'<test>' terminated
-      # with signal") and the next "failed command:" line is its shard. This
-      # step runs that shard again directly, with the same seed: the runner
-      # then prints each test name before the test, and we see whether the
-      # crash repeats. If the log has no "Build Summary:", the build runner
-      # itself stopped and named nothing (macterm/macterm#896, run
-      # 44252236903: its binary has no debug info, so it prints no trace).
-      # Then all the tests run once in one process. This step prints the
-      # result only: the job stays failed.
+      # Runs each crashed test process again, without --listen=-, so that it
+      # prints each test name before the test. If the build runner stopped
+      # before its summary, all the tests run once in one process. The job
+      # stays failed.
       - name: Run crashed shards directly
         if: failure() && steps.tests.outcome == 'failure'
         shell: bash
@@ -115,31 +109,31 @@ jobs:
           SEED: ${{ steps.tests.outputs.seed }}
         run: |
           log="$RUNNER_TEMP/test.log"
-          bin=$(ls -t .zig-cache/o/*/ghostty-test 2>/dev/null | head -n 1)
-          if [ -z "$bin" ]; then
-            echo "There is no ghostty-test binary. The tests did not compile."
-            exit 0
-          fi
-          shards=$(awk '
-            /terminated with signal/ { crashed = 1 }
-            crashed && /failed command: / {
-              if (match($0, /--shard=[0-9]+\/[0-9]+/)) print substr($0, RSTART, RLENGTH)
-              else print "--shard=0/1"
+          # The "failed command:" line after a crash is the command of its process.
+          cmds=$(awk '
+            /(terminated|stopped) with signal|test process unexpectedly|terminated for unknown reason/ { crashed = 1 }
+            crashed && /^failed command: .*ghostty-test/ {
+              sub(/^failed command: /, ""); sub(/ --listen=-$/, ""); print
               crashed = 0
             }' "$log" | sort -u)
-          if [ -z "$shards" ]; then
+          if [ -z "$cmds" ]; then
             if grep -q '^Build Summary:' "$log"; then
-              echo "No test crashed."
+              echo "No test process crashed."
+              exit 0
+            fi
+            bin=$(ls -t .zig-cache/o/*/ghostty-test 2>/dev/null | head -n 1) || true
+            if [ -z "$bin" ]; then
+              echo "There is no ghostty-test binary."
               exit 0
             fi
             echo "The build runner stopped before its summary. All the tests run once in one process."
-            shards="--shard=0/1"
+            cmds="$bin --seed=$SEED"
           fi
-          for shard in $shards; do
-            echo "$bin --seed=$SEED $shard"
-            "$bin" --seed="$SEED" "$shard" && rc=0 || rc=$?
-            echo "$shard: exit code $rc"
-          done
+          while read -r cmd; do
+            echo "$cmd"
+            $cmd < /dev/null && rc=0 || rc=$?
+            echo "Exit code: $rc"
+          done <<< "$cmds"
 
       # The tests do not compile the embedded apprt, which is the C API. A pull
       # request therefore also builds the library, as the build job does. It
