@@ -2180,12 +2180,16 @@ pub fn dumpTextLocked(
 
         // Our sizes are all scaled so we need to send the unscaled values back.
         const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+        const z = self.zoom();
         const x: f64 = x: {
             // Simple x * cell width gives the left
             var x: f64 = @floatFromInt(tl_coord.x * self.size.cell.width);
 
             // Add padding
             x += @floatFromInt(self.size.padding.left);
+
+            // Zoom
+            x = z.forward(x, 0).x;
 
             // Scale
             x /= content_scale.x;
@@ -2202,6 +2206,9 @@ pub fn dumpTextLocked(
 
             // Add padding
             y += @floatFromInt(self.size.padding.top);
+
+            // Zoom
+            y = z.forward(0, y).y;
 
             // Scale
             y /= content_scale.y;
@@ -2314,7 +2321,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
         // We want the midpoint
         x += @as(f64, @floatFromInt(self.size.cell.width)) / 2;
 
-        // Where the zoomed picture draws it
+        // Zoom
         x = z.forward(x, 0).x;
 
         // And scale it
@@ -2333,7 +2340,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
         // Of the row as it is drawn
         y += shift;
 
-        // Where the zoomed picture draws it
+        // Zoom
         y = z.forward(0, y).y;
 
         // And scale it
@@ -4271,11 +4278,12 @@ pub fn mouseButtonCallback(
             break :click;
         };
 
+        const base = self.zoom().inverse(pos.x, pos.y);
         var press_selection = try self.mouse.selection_gesture.press(t, .{
             .time = std.Io.Timestamp.now(global.io(), .awake),
             .pin = pin,
-            .xpos = self.zoom().inverse(pos.x, pos.y).x,
-            .ypos = self.zoom().inverse(pos.x, pos.y).y,
+            .xpos = base.x,
+            .ypos = base.y,
             .max_distance = @floatFromInt(self.size.cell.width),
             .repeat_interval = self.config.mouse_interval,
             .word_boundary_codepoints = self.config.selection_word_chars,
@@ -5058,12 +5066,11 @@ fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
 }
 
 /// The zoom of the picture (`renderer.Zoom`), resolved for the surface's
-/// size. Every pointer becomes a cell through its inverse in
-/// `posToViewport` (and `posToPin`, `mouseReportPos`), and the IME point
-/// goes through its forward in `imePointScaled`. A selection also gets
-/// the pointer's x through the inverse, for the half of the cell it is
-/// on, and keeps its y on screen, so a drag past the surface's edge
-/// still scrolls.
+/// size. A pointer becomes a cell through its inverse: `posToViewport`,
+/// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
+/// keeps its y on screen, so a drag past the edge still scrolls. A cell
+/// becomes a point for the host through its forward: `imePointScaled`
+/// and the text point of `dumpTextLocked`.
 ///
 /// Precondition: the render_state mutex must be held.
 fn zoom(self: *const Surface) rendererpkg.Zoom {
@@ -5075,9 +5082,9 @@ fn zoom(self: *const Surface) rendererpkg.Zoom {
 
 /// Set the zoom of the picture, in surface pixels: `scale` about the
 /// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
-/// A scale of 1 is no zoom. The values are kept as given and clamped
-/// at each use (`renderer.Zoom.resolve`). The font size, the grid and
-/// the pty size do not change.
+/// A scale of 1 is no zoom. The values are kept as given and clamped at
+/// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
+/// font size, the grid and the pty size do not change.
 pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
@@ -5121,7 +5128,8 @@ fn viewportShift(self: *const Surface) terminal.RenderState.Shift {
 }
 
 /// The pin of the cell drawn under a surface position. This is
-/// `posToViewport` resolved to a pin, except on the rows smooth scrolling
+/// `posToViewport` (the zoom undone, then the shifts) resolved to a pin,
+/// except on the rows smooth scrolling
 /// reveals above the viewport: a grid shifted down draws the bottom of the
 /// scrollback row above the viewport — all of it, when the leftover height
 /// is nearly a cell — and a viewport coordinate, which cannot go above the

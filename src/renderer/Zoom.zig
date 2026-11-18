@@ -1,15 +1,14 @@
-//! The zoom of a surface's picture: a view transform that scales what the
-//! surface draws about an anchor point and then pans it, as a pinch zooms
-//! a page in a browser. The font size, the grid and the pty size never
-//! change. Every other position (cells, smooth-scroll shifts, region
-//! scrolls, padding) stays in base surface pixels, and the zoom applies
-//! last.
+//! The zoom of a surface's picture. It is a view transform: it scales the
+//! picture about an anchor point, then pans it. The font size, the grid
+//! and the pty size do not change. Every other position (cells,
+//! smooth-scroll shifts, region scrolls, padding) stays in base surface
+//! pixels, and the zoom applies last.
 //!
 //! `forward` takes a base surface point to the point on screen where the
 //! zoomed picture draws it. `inverse` takes a point on screen back to the
-//! base surface point drawn there. The surface applies the inverse once,
-//! where a pointer becomes a cell (`Surface.posToViewport`), and the
-//! forward once, where a cell becomes a point for the host (`imePoint`).
+//! base surface point drawn there. The surface applies the inverse where
+//! a pointer becomes a cell, and the forward where a cell becomes a point
+//! for the host (see `Surface.zoom`).
 //!
 //! All values are in surface pixels.
 const Zoom = @This();
@@ -18,8 +17,8 @@ const std = @import("std");
 const testing = std.testing;
 const size = @import("size.zig");
 
-/// The largest scale. A zoomed glyph atlas doubles in steps, so above 3x
-/// it costs 2.5 to 4 times the memory of 3x (design 012, experiment E3).
+/// The largest scale. A zoomed glyph atlas doubles in steps, so 4x costs
+/// 2.5 to 4 times the memory of 3x.
 pub const max_scale: f64 = 3;
 
 /// 1 is no zoom. The picture never zooms out: outside the grid there is
@@ -197,13 +196,13 @@ test "pane zoom: inverse is the inverse of forward" {
     }
 }
 
-test "pane zoom: a point on screen hits the cell drawn there, grid unchanged" {
+test "pane zoom: each cell drawn zoomed hit tests to that cell" {
     const s: size.Size = .{
         .screen = .{ .width = 1610, .height = 1034 },
         .cell = .{ .width = 16, .height = 34 },
         .padding = .{ .top = 8, .bottom = 8, .left = 5, .right = 5 },
     };
-    const before = s.grid();
+    const grid = s.grid();
     const z = resolve(.{
         .scale = 3,
         .anchor_x = 700,
@@ -214,9 +213,9 @@ test "pane zoom: a point on screen hits the cell drawn there, grid unchanged" {
 
     // The center of every cell, drawn zoomed, hit tests to that cell.
     var row: u32 = 0;
-    while (row < before.rows) : (row += 1) {
+    while (row < grid.rows) : (row += 1) {
         var col: u32 = 0;
-        while (col < before.columns) : (col += 1) {
+        while (col < grid.columns) : (col += 1) {
             const cx: f64 = @floatFromInt(s.padding.left + col * s.cell.width + s.cell.width / 2);
             const cy: f64 = @floatFromInt(s.padding.top + row * s.cell.height + s.cell.height / 2);
             const drawn = z.forward(cx, cy);
@@ -227,9 +226,4 @@ test "pane zoom: a point on screen hits the cell drawn there, grid unchanged" {
             try testing.expectEqual(row, cell.y);
         }
     }
-
-    // The zoom is a view transform: the grid is what it was.
-    const after = s.grid();
-    try testing.expectEqual(before.columns, after.columns);
-    try testing.expectEqual(before.rows, after.rows);
 }
