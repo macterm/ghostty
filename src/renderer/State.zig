@@ -33,6 +33,11 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// The zoom of the picture as the host asked for it, in surface pixels
+/// (`Surface.setZoom`). Resolve it against the surface size before use
+/// (`renderer.Zoom.resolve`): a resize can make the pan too large.
+zoom: renderer.Zoom = .identity,
+
 /// Set by the surface as the first step of its teardown, before it joins
 /// its threads. A producer on a thread the surface joins (the IO thread,
 /// its read thread) pushes to the surface, renderer and termio mailboxes

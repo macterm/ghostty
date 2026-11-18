@@ -2237,6 +2237,26 @@ pub const CAPI = struct {
         surface.updateContentScale(x, y);
     }
 
+    /// Zoom the picture of the surface. The anchor and the pan are in
+    /// points, as mouse positions are; see `CoreSurface.setZoom`.
+    export fn ghostty_surface_set_zoom(
+        surface: *Surface,
+        scale: f64,
+        anchor_x: f64,
+        anchor_y: f64,
+        pan_x: f64,
+        pan_y: f64,
+    ) void {
+        const content = surface.getContentScale() catch apprt.ContentScale{ .x = 1, .y = 1 };
+        surface.core_surface.setZoom(.{
+            .scale = scale,
+            .anchor_x = anchor_x * content.x,
+            .anchor_y = anchor_y * content.y,
+            .pan_x = pan_x * content.x,
+            .pan_y = pan_y * content.y,
+        });
+    }
+
     /// Update the focused state of a surface.
     export fn ghostty_surface_set_focus(surface: *Surface, focused: bool) void {
         surface.focusCallback(focused);
