@@ -65,6 +65,7 @@ env:
     .github/downstream/0022-manual-io.patch
     .github/downstream/0023-resolve-launch.patch
     .github/downstream/0024-idle-targets-volatile.patch
+    .github/downstream/0025-pane-zoom.patch
 
 jobs:
   sync:
