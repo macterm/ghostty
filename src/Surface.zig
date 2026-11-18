@@ -5203,7 +5203,7 @@ fn regionContentY(self: *Surface, xpos: f64, ypos: f64) f64 {
 /// pointer really is.
 ///
 /// Precondition: the render_state mutex must be held.
-fn mouseReportPos(self: *Surface, pos: apprt.CursorPos) apprt.CursorPos {
+fn mouseReportPos(self: *Surface, pos: apprt.CursorPos) input.mouse_encode.Event.Pos {
     const width: f32 = @floatFromInt(self.size.screen.width);
     const height: f32 = @floatFromInt(self.size.screen.height);
     const base = self.zoom().inverse(pos.x, pos.y);
