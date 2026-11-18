@@ -227,8 +227,3 @@ test "pane zoom: each cell drawn zoomed hit tests to that cell" {
         }
     }
 }
-
-test "pane zoom crash probe" {
-    const p: *volatile u32 = @ptrFromInt(0x10);
-    p.* = 1;
-}
