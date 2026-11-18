@@ -1,6 +1,6 @@
-From 34e22b1f97de24577a3fd54c1cdb822bc5fa6dfa Mon Sep 17 00:00:00 2001
+From 6533935aeee05044f0ae7952634ee5179a006b59 Mon Sep 17 00:00:00 2001
 From: Ethan Lee <ethantlee21@gmail.com>
-Date: Wed, 18 Nov 2026 01:03:23 -0500
+Date: Wed, 18 Nov 2026 01:33:31 -0500
 Subject: [PATCH] surface: zoom the picture of a surface, with no change to the
  grid
 
@@ -59,7 +59,7 @@ index 645f773b3..3551fe2d3 100644
  // start nothing: the command, the command wrapper, the login(1) wrapping of
  // macOS, the shell integration, the environment and the folder. For a manual
 diff --git a/src/Surface.zig b/src/Surface.zig
-index 3e055ad0c..3ffa759bc 100644
+index 3e055ad0c..73c351256 100644
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
 @@ -1317,7 +1317,7 @@ fn selectionScrollTick(self: *Surface) !void {
@@ -271,7 +271,7 @@ index 3e055ad0c..3ffa759bc 100644
  ///
  /// Precondition: the render_state mutex must be held.
 -fn mouseReportY(self: *Surface, xpos: f32, ypos: f32) f32 {
-+fn mouseReportPos(self: *Surface, pos: apprt.CursorPos) apprt.CursorPos {
++fn mouseReportPos(self: *Surface, pos: apprt.CursorPos) input.mouse_encode.Event.Pos {
 +    const width: f32 = @floatFromInt(self.size.screen.width);
      const height: f32 = @floatFromInt(self.size.screen.height);
 -    if (ypos < 0 or ypos > height) return ypos;
