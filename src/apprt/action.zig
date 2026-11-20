@@ -367,6 +367,25 @@ pub const Action = union(Key) {
     /// Set the application window theme for this session.
     set_window_theme: WindowTheme,
 
+    /// A throttled heartbeat emitted from the IO path whenever the
+    /// child/pty produces output. Unlike `scrollbar` (a renderer-track
+    /// action that stops while the surface is occluded), this is delivered
+    /// via the surface mailbox -> app-tick track, so it keeps firing for
+    /// occluded/backgrounded surfaces. Embedders use it to drive an
+    /// activity indicator for programs that redraw in place (TUI spinners)
+    /// or run in background tabs. The payload is the current scrollbar
+    /// geometry, matching `scrollbar`.
+    output_activity: terminal.Scrollbar,
+
+    /// The program sent an APC sequence that no protocol of the
+    /// terminal recognizes. The payload is given as it arrived,
+    /// without the `ESC _` and `ST` framing, cut at
+    /// `StreamHandler.unknown_apc_max_bytes`. The terminal itself
+    /// discards such a sequence, so this is for an embedder with a
+    /// private contract with a program in the pty: Macterm's zmx fork
+    /// reports the foreground process of a session this way.
+    unknown_apc: UnknownApc,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -440,6 +459,8 @@ pub const Action = union(Key) {
         move_tab_to_new_window,
         resize_window,
         set_window_theme,
+        output_activity,
+        unknown_apc,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1026,18 +1047,56 @@ pub const CloseTabMode = enum(c_int) {
 pub const CommandFinished = struct {
     exit_code: ?u8,
     duration: configpkg.Config.Duration,
+    /// The command as typed at the prompt, from the input cells of the
+    /// prompt (fork patch 0019, `Screen.commandInputString`). null when
+    /// the shell marked no input. Valid for the action only.
+    command: ?[:0]const u8 = null,
 
     /// sync with ghostty_action_command_finished_s in ghostty.h
     pub const C = extern struct {
         exit_code: i16,
         duration: u64,
+        command: ?[*:0]const u8,
     };
 
     pub fn cval(self: CommandFinished) C {
         return .{
             .exit_code = self.exit_code orelse -1,
             .duration = self.duration.duration,
+            .command = if (self.command) |c| c.ptr else null,
         };
+    }
+};
+
+pub const UnknownApc = struct {
+    /// The APC payload, without the framing. Borrowed: valid for the
+    /// action only.
+    data: []const u8,
+    /// The payload was cut at the capture limit.
+    truncated: bool,
+
+    // Sync with: ghostty_action_unknown_apc_s
+    pub const C = extern struct {
+        data: [*]const u8,
+        len: usize,
+        truncated: bool,
+    };
+
+    pub fn cval(self: UnknownApc) C {
+        return .{
+            .data = self.data.ptr,
+            .len = self.data.len,
+            .truncated = self.truncated,
+        };
+    }
+
+    test "unknown apc: the C value carries the bytes and the cut flag" {
+        const testing = std.testing;
+        const payload = "zmx;foreground;1;1;zsh;-zsh";
+        const c = (UnknownApc{ .data = payload, .truncated = true }).cval();
+        try testing.expectEqual(payload.len, c.len);
+        try testing.expectEqualStrings(payload, c.data[0..c.len]);
+        try testing.expect(c.truncated);
     }
 };
 
