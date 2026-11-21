@@ -1,0 +1,597 @@
+From 6533935aeee05044f0ae7952634ee5179a006b59 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Wed, 18 Nov 2026 01:33:31 -0500
+Subject: [PATCH] surface: zoom the picture of a surface, with no change to the
+ grid
+
+A pinch in Macterm zooms the picture of a pane. The font size, the grid and the pty size must not change,
+so the zoom is a view transform: scale about an anchor point, then a
+pan. Every other position stays in base surface pixels, and the zoom
+applies last.
+
+renderer.Zoom holds the transform and its math. resolve clamps the
+scale to 1 through 3, the anchor to the surface, and the pan so that
+the zoomed picture covers the surface. A value that is not finite is no
+zoom. The render state keeps the request (renderer.State.zoom), and the
+surface resolves it against its size at each use, so a resize needs no
+update.
+
+The surface applies the inverse where a pointer becomes a cell
+(posToViewport, posToPin, mouse reports, the x of a selection) and the
+forward where a cell becomes a point for the host (imePointScaled and
+the text point of dumpTextLocked), so the IME window, Quick Look and
+the popovers that anchor to these points follow the zoom. ghostty_surface_set_zoom sets the request, in points.
+
+The renderer does not draw the zoom yet.
+---
+ include/ghostty.h      |  14 +++
+ src/Surface.zig        | 104 +++++++++++++++----
+ src/apprt/embedded.zig |  20 ++++
+ src/renderer.zig       |   2 +
+ src/renderer/State.zig |   5 +
+ src/renderer/Zoom.zig  | 229 +++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 352 insertions(+), 22 deletions(-)
+ create mode 100644 src/renderer/Zoom.zig
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 645f773b3..3551fe2d3 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1264,6 +1264,20 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
++// Zoom the picture of the surface: scale it about the anchor, then move it by
++// the pan. The anchor and the pan are in the units of
++// ghostty_surface_mouse_pos. A scale of 1 is no zoom. The scale is clamped to
++// 1 through 3, the anchor to the surface, and the pan so that the picture
++// covers the surface. The font size, the grid and the pty size do not change.
++// Mouse positions, ghostty_surface_ime_point and the tl_px_x and tl_px_y of a
++// ghostty_text_s follow the zoom. The values are kept in pixels: after a
++// change of the content scale, set the zoom again.
++GHOSTTY_API void ghostty_surface_set_zoom(ghostty_surface_t,
++                                          double scale,
++                                          double anchor_x,
++                                          double anchor_y,
++                                          double pan_x,
++                                          double pan_y);
+ // Resolve what ghostty_surface_new would run in a pty for these options, and
+ // start nothing: the command, the command wrapper, the login(1) wrapping of
+ // macOS, the shell integration, the environment and the folder. For a manual
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 3e055ad0c..73c351256 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -1317,7 +1317,7 @@ fn selectionScrollTick(self: *Surface) !void {
+ 
+     const selection = self.mouse.selection_gesture.autoscrollTick(t, .{
+         .viewport = pos_vp,
+-        .xpos = pos.x,
++        .xpos = self.zoom().inverse(pos.x, pos.y).x,
+         .ypos = pos.y,
+         .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
+         .word_boundary_codepoints = self.config.selection_word_chars,
+@@ -2180,6 +2180,7 @@ pub fn dumpTextLocked(
+ 
+         // Our sizes are all scaled so we need to send the unscaled values back.
+         const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
++        const z = self.zoom();
+         const x: f64 = x: {
+             // Simple x * cell width gives the left
+             var x: f64 = @floatFromInt(tl_coord.x * self.size.cell.width);
+@@ -2187,6 +2188,9 @@ pub fn dumpTextLocked(
+             // Add padding
+             x += @floatFromInt(self.size.padding.left);
+ 
++            // Zoom
++            x = z.forward(x, 0).x;
++
+             // Scale
+             x /= content_scale.x;
+ 
+@@ -2203,6 +2207,9 @@ pub fn dumpTextLocked(
+             // Add padding
+             y += @floatFromInt(self.size.padding.top);
+ 
++            // Zoom
++            y = z.forward(0, y).y;
++
+             // Scale
+             y /= content_scale.y;
+ 
+@@ -2298,6 +2305,8 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+     // a region scroll animation shifts the cursor's region further still.
+     const shift = self.viewportPixelShift() +
+         self.regionShifts().offsetAt(cursor.x, cursor.y);
++    // The zoom applies last, as the picture is drawn.
++    const z = self.zoom();
+     self.renderer_state.mutex.unlock(global.io());
+ 
+     // TODO: need to handle when scrolling and the cursor is not
+@@ -2312,6 +2321,9 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+         // We want the midpoint
+         x += @as(f64, @floatFromInt(self.size.cell.width)) / 2;
+ 
++        // Zoom
++        x = z.forward(x, 0).x;
++
+         // And scale it
+         x /= scale.x;
+ 
+@@ -2328,6 +2340,9 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+         // Of the row as it is drawn
+         y += shift;
+ 
++        // Zoom
++        y = z.forward(0, y).y;
++
+         // And scale it
+         y /= scale.y;
+ 
+@@ -2338,6 +2353,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+     // rendering only renders in a single line.
+     const height: f64 = height: {
+         var height: f64 = @floatFromInt(self.size.cell.height);
++        height *= z.scale;
+         height /= scale.y;
+         break :height height;
+     };
+@@ -2357,7 +2373,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+         // that is so I'm going to just leave this comment here so its known
+         // that I left this out on purpose pending more investigation.
+ 
+-        break :width width;
++        break :width width * z.scale;
+     };
+ 
+     return .{
+@@ -4005,10 +4021,7 @@ fn mouseReport(
+         .button = button,
+         .action = action,
+         .mods = mods,
+-        .pos = .{
+-            .x = pos.x,
+-            .y = self.mouseReportY(pos.x, pos.y),
+-        },
++        .pos = self.mouseReportPos(pos),
+     }, encoding_opts) catch |err| switch (err) {
+         error.WriteFailed => {
+             // This should never happen since mouse events should never
+@@ -4265,11 +4278,12 @@ pub fn mouseButtonCallback(
+             break :click;
+         };
+ 
++        const base = self.zoom().inverse(pos.x, pos.y);
+         var press_selection = try self.mouse.selection_gesture.press(t, .{
+             .time = std.Io.Timestamp.now(global.io(), .awake),
+             .pin = pin,
+-            .xpos = pos.x,
+-            .ypos = pos.y,
++            .xpos = base.x,
++            .ypos = base.y,
+             .max_distance = @floatFromInt(self.size.cell.width),
+             .repeat_interval = self.config.mouse_interval,
+             .word_boundary_codepoints = self.config.selection_word_chars,
+@@ -4970,7 +4984,7 @@ pub fn cursorPosCallback(
+         // Perform our drag behavior in our gesture handler.
+         const drag_selection = self.mouse.selection_gesture.drag(t, .{
+             .pin = pin,
+-            .xpos = pos.x,
++            .xpos = self.zoom().inverse(pos.x, pos.y).x,
+             .ypos = pos.y,
+             .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
+             .word_boundary_codepoints = self.config.selection_word_chars,
+@@ -5030,6 +5044,15 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
+ ///
+ /// Precondition: the render_state mutex must be held.
+ pub fn posToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
++    const base = self.zoom().inverse(xpos, ypos);
++    return self.basePosToViewport(base.x, base.y);
++}
++
++/// `posToViewport` for a point in base surface pixels, with the zoom
++/// already undone.
++///
++/// Precondition: the render_state mutex must be held.
++fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
+     // Smooth scrolling draws the viewport shifted by a sub-row offset, and
+     // a region scroll animation draws its region's content further off
+     // still; undo both so the hit-tested cell is the one under the pointer.
+@@ -5042,6 +5065,32 @@ pub fn posToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
+     return .{ .x = grid.x, .y = grid.y };
+ }
+ 
++/// The zoom of the picture (`renderer.Zoom`), resolved for the surface's
++/// size. A pointer becomes a cell through its inverse: `posToViewport`,
++/// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
++/// keeps its y on screen, so a drag past the edge still scrolls. A cell
++/// becomes a point for the host through its forward: `imePointScaled`
++/// and the text point of `dumpTextLocked`.
++///
++/// Precondition: the render_state mutex must be held.
++fn zoom(self: *const Surface) rendererpkg.Zoom {
++    return self.renderer_state.zoom.resolve(
++        @floatFromInt(self.size.screen.width),
++        @floatFromInt(self.size.screen.height),
++    );
++}
++
++/// Set the zoom of the picture, in surface pixels: `scale` about the
++/// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
++/// A scale of 1 is no zoom. The values are kept as given and clamped at
++/// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
++/// font size, the grid and the pty size do not change.
++pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    self.renderer_state.zoom = request;
++}
++
+ /// How far below its row-aligned position the renderer draws the
+ /// viewport's first row, in pixels: the remainder of a scroll gesture plus
+ /// the height the viewport's rows don't account for, which under
+@@ -5079,7 +5128,8 @@ fn viewportShift(self: *const Surface) terminal.RenderState.Shift {
+ }
+ 
+ /// The pin of the cell drawn under a surface position. This is
+-/// `posToViewport` resolved to a pin, except on the rows smooth scrolling
++/// `posToViewport` (the zoom undone, then the shifts) resolved to a pin,
++/// except on the rows smooth scrolling
+ /// reveals above the viewport: a grid shifted down draws the bottom of the
+ /// scrollback row above the viewport — all of it, when the leftover height
+ /// is nearly a cell — and a viewport coordinate, which cannot go above the
+@@ -5089,9 +5139,10 @@ fn viewportShift(self: *const Surface) terminal.RenderState.Shift {
+ /// Precondition: the render_state mutex must be held.
+ fn posToPin(self: *Surface, xpos: f64, ypos: f64) ?terminal.Pin {
+     const screen: *terminal.Screen = self.io.terminal.screens.active;
+-    const pt = self.posToViewport(xpos, ypos);
++    const base = self.zoom().inverse(xpos, ypos);
++    const pt = self.basePosToViewport(base.x, base.y);
+     const above = self.viewportShift().rowsAboveAt(
+-        ypos - @as(f64, @floatFromInt(self.size.padding.top)),
++        base.y - @as(f64, @floatFromInt(self.size.padding.top)),
+         @floatFromInt(self.size.cell.height),
+     );
+     if (above == 0) return screen.pages.pin(.{ .viewport = pt });
+@@ -5144,19 +5195,28 @@ fn regionContentY(self: *Surface, xpos: f64, ypos: f64) f64 {
+     ) + top;
+ }
+ 
+-/// The pointer's y for a mouse report: where it falls on the grid as drawn
+-/// (see `viewportPixelShift` and `regionContentY`), so a program is told
+-/// the cell the user clicked. A pointer outside the surface is left alone
+-/// and one inside is kept inside, so whether an event happened outside the
+-/// viewport is still decided by where the pointer really is.
++/// The pointer for a mouse report: where it falls on the grid as drawn
++/// (see `zoom`, `viewportPixelShift` and `regionContentY`), so a program
++/// is told the cell the user clicked. On each axis, a pointer outside the
++/// surface is left alone and one inside is kept inside, so whether an
++/// event happened outside the viewport is still decided by where the
++/// pointer really is.
+ ///
+ /// Precondition: the render_state mutex must be held.
+-fn mouseReportY(self: *Surface, xpos: f32, ypos: f32) f32 {
++fn mouseReportPos(self: *Surface, pos: apprt.CursorPos) input.mouse_encode.Event.Pos {
++    const width: f32 = @floatFromInt(self.size.screen.width);
+     const height: f32 = @floatFromInt(self.size.screen.height);
+-    if (ypos < 0 or ypos > height) return ypos;
+-    const shift = self.viewportPixelShift();
+-    const y: f32 = @floatCast(self.regionContentY(xpos, @as(f64, ypos) - shift));
+-    return std.math.clamp(y, 0, height);
++    const base = self.zoom().inverse(pos.x, pos.y);
++    const x: f32 = if (pos.x < 0 or pos.x > width)
++        pos.x
++    else
++        std.math.clamp(@as(f32, @floatCast(base.x)), 0, width);
++    const y: f32 = if (pos.y < 0 or pos.y > height) pos.y else y: {
++        const shift = self.viewportPixelShift();
++        const content: f32 = @floatCast(self.regionContentY(x, base.y - shift));
++        break :y std.math.clamp(content, 0, height);
++    };
++    return .{ .x = x, .y = y };
+ }
+ 
+ /// Scroll to the bottom of the viewport.
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 14667cd15..127dcc8f1 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -2237,6 +2237,26 @@ pub const CAPI = struct {
+         surface.updateContentScale(x, y);
+     }
+ 
++    /// Zoom the picture of the surface. The anchor and the pan are in
++    /// points, as mouse positions are; see `CoreSurface.setZoom`.
++    export fn ghostty_surface_set_zoom(
++        surface: *Surface,
++        scale: f64,
++        anchor_x: f64,
++        anchor_y: f64,
++        pan_x: f64,
++        pan_y: f64,
++    ) void {
++        const content = surface.getContentScale() catch apprt.ContentScale{ .x = 1, .y = 1 };
++        surface.core_surface.setZoom(.{
++            .scale = scale,
++            .anchor_x = anchor_x * content.x,
++            .anchor_y = anchor_y * content.y,
++            .pan_x = pan_x * content.x,
++            .pan_y = pan_y * content.y,
++        });
++    }
++
+     /// Update the focused state of a surface.
+     export fn ghostty_surface_set_focus(surface: *Surface, focused: bool) void {
+         surface.focusCallback(focused);
+diff --git a/src/renderer.zig b/src/renderer.zig
+index b5ba2c3ef..908881c4e 100644
+--- a/src/renderer.zig
++++ b/src/renderer.zig
+@@ -19,6 +19,7 @@ pub const Metal = @import("renderer/Metal.zig");
+ pub const OpenGL = @import("renderer/OpenGL.zig");
+ pub const Options = @import("renderer/Options.zig");
+ pub const Overlay = @import("renderer/Overlay.zig");
++pub const Zoom = @import("renderer/Zoom.zig");
+ pub const Thread = @import("renderer/Thread.zig");
+ pub const State = @import("renderer/State.zig");
+ pub const CursorStyle = cursor.Style;
+@@ -66,4 +67,5 @@ test {
+     _ = size;
+     _ = Thread;
+     _ = State;
++    _ = Zoom;
+ }
+diff --git a/src/renderer/State.zig b/src/renderer/State.zig
+index 586e2405e..9913cf2a4 100644
+--- a/src/renderer/State.zig
++++ b/src/renderer/State.zig
+@@ -33,6 +33,11 @@ preedit: ?Preedit = null,
+ /// need about the mouse.
+ mouse: Mouse = .{},
+ 
++/// The zoom of the picture as the host asked for it, in surface pixels
++/// (`Surface.setZoom`). Resolve it against the surface size before use
++/// (`renderer.Zoom.resolve`): a resize can make the pan too large.
++zoom: renderer.Zoom = .identity,
++
+ /// Set by the surface as the first step of its teardown, before it joins
+ /// its threads. A producer on a thread the surface joins (the IO thread,
+ /// its read thread) pushes to the surface, renderer and termio mailboxes
+diff --git a/src/renderer/Zoom.zig b/src/renderer/Zoom.zig
+new file mode 100644
+index 000000000..c8f77d00e
+--- /dev/null
++++ b/src/renderer/Zoom.zig
+@@ -0,0 +1,229 @@
++//! The zoom of a surface's picture. It is a view transform: it scales the
++//! picture about an anchor point, then pans it. The font size, the grid
++//! and the pty size do not change. Every other position (cells,
++//! smooth-scroll shifts, region scrolls, padding) stays in base surface
++//! pixels, and the zoom applies last.
++//!
++//! `forward` takes a base surface point to the point on screen where the
++//! zoomed picture draws it. `inverse` takes a point on screen back to the
++//! base surface point drawn there. The surface applies the inverse where
++//! a pointer becomes a cell, and the forward where a cell becomes a point
++//! for the host (see `Surface.zoom`).
++//!
++//! All values are in surface pixels.
++const Zoom = @This();
++
++const std = @import("std");
++const testing = std.testing;
++const size = @import("size.zig");
++
++/// The largest scale. A zoomed glyph atlas doubles in steps, so 4x costs
++/// 2.5 to 4 times the memory of 3x.
++pub const max_scale: f64 = 3;
++
++/// 1 is no zoom. The picture never zooms out: outside the grid there is
++/// nothing to draw.
++scale: f64 = 1,
++
++/// The point that stays in place when the scale changes.
++anchor_x: f64 = 0,
++anchor_y: f64 = 0,
++
++/// The move of the zoomed picture after the scale.
++pan_x: f64 = 0,
++pan_y: f64 = 0,
++
++pub const identity: Zoom = .{};
++
++/// The zoom to draw for a request on a surface of `width` x `height`
++/// pixels. The scale is clamped to 1 through `max_scale`, the anchor to
++/// the surface, and the pan so that the zoomed picture covers all of the
++/// surface. A request with a value that is not finite is no zoom.
++///
++/// The surface keeps the request and resolves it at each use, so a resize
++/// clamps the pan again with nothing to remember.
++pub fn resolve(request: Zoom, width: f64, height: f64) Zoom {
++    const values = [_]f64{
++        request.scale,
++        request.anchor_x,
++        request.anchor_y,
++        request.pan_x,
++        request.pan_y,
++        width,
++        height,
++    };
++    for (values) |v| {
++        if (!std.math.isFinite(v)) return identity;
++    }
++    if (width <= 0 or height <= 0) return identity;
++
++    const scale = std.math.clamp(request.scale, 1, max_scale);
++    if (scale == 1) return identity;
++
++    const ax = std.math.clamp(request.anchor_x, 0, width);
++    const ay = std.math.clamp(request.anchor_y, 0, height);
++    return .{
++        .scale = scale,
++        .anchor_x = ax,
++        .anchor_y = ay,
++        .pan_x = clampPan(request.pan_x, ax, width, scale),
++        .pan_y = clampPan(request.pan_y, ay, height, scale),
++    };
++}
++
++/// The pan on one axis that keeps the zoomed edges outside the surface:
++/// the near edge `forward(0) <= 0` and the far edge `forward(len) >= len`.
++fn clampPan(pan: f64, anchor: f64, len: f64, scale: f64) f64 {
++    const grow = scale - 1;
++    return std.math.clamp(pan, -(len - anchor) * grow, anchor * grow);
++}
++
++pub fn isIdentity(self: Zoom) bool {
++    return self.scale == 1 and self.pan_x == 0 and self.pan_y == 0;
++}
++
++/// The point on screen where the picture draws the base point (`x`, `y`).
++pub fn forward(self: Zoom, x: f64, y: f64) size.Coordinate.Surface {
++    return .{
++        .x = self.anchor_x + self.scale * (x - self.anchor_x) + self.pan_x,
++        .y = self.anchor_y + self.scale * (y - self.anchor_y) + self.pan_y,
++    };
++}
++
++/// The base point that the picture draws at the screen point (`x`, `y`).
++pub fn inverse(self: Zoom, x: f64, y: f64) size.Coordinate.Surface {
++    return .{
++        .x = self.anchor_x + (x - self.anchor_x - self.pan_x) / self.scale,
++        .y = self.anchor_y + (y - self.anchor_y - self.pan_y) / self.scale,
++    };
++}
++
++test "pane zoom: identity changes no point" {
++    const z = resolve(.{}, 800, 600);
++    try testing.expect(z.isIdentity());
++    const p = z.forward(123.5, 45.25);
++    try testing.expectEqual(@as(f64, 123.5), p.x);
++    try testing.expectEqual(@as(f64, 45.25), p.y);
++    const q = z.inverse(123.5, 45.25);
++    try testing.expectEqual(@as(f64, 123.5), q.x);
++    try testing.expectEqual(@as(f64, 45.25), q.y);
++}
++
++test "pane zoom: the anchor stays in place" {
++    const z = resolve(.{ .scale = 2, .anchor_x = 300, .anchor_y = 200 }, 800, 600);
++    const p = z.forward(300, 200);
++    try testing.expectEqual(@as(f64, 300), p.x);
++    try testing.expectEqual(@as(f64, 200), p.y);
++    // A point 10 px right of the anchor draws 20 px right of it.
++    try testing.expectEqual(@as(f64, 320), z.forward(310, 200).x);
++}
++
++test "pane zoom: scale is clamped to 1 through 3" {
++    const small = resolve(.{ .scale = 0.5, .anchor_x = 10, .pan_x = 5 }, 800, 600);
++    try testing.expect(small.isIdentity());
++    const big = resolve(.{ .scale = 8 }, 800, 600);
++    try testing.expectEqual(max_scale, big.scale);
++}
++
++test "pane zoom: a value that is not finite is no zoom" {
++    const nan = std.math.nan(f64);
++    const inf = std.math.inf(f64);
++    try testing.expect(resolve(.{ .scale = nan }, 800, 600).isIdentity());
++    try testing.expect(resolve(.{ .scale = 2, .anchor_x = inf }, 800, 600).isIdentity());
++    try testing.expect(resolve(.{ .scale = 2, .pan_y = -inf }, 800, 600).isIdentity());
++    try testing.expect(resolve(.{ .scale = 2 }, 0, 600).isIdentity());
++}
++
++test "pane zoom: the pan keeps the surface covered" {
++    const w: f64 = 800;
++    const h: f64 = 600;
++    const pans = [_]f64{ -10_000, -500, -1, 0, 1, 500, 10_000 };
++    const anchors = [_]f64{ -50, 0, 200, 400, 800, 900 };
++    for ([_]f64{ 1.05, 1.5, 2, 3 }) |s| {
++        for (anchors) |a| {
++            for (pans) |p| {
++                const z = resolve(.{
++                    .scale = s,
++                    .anchor_x = a,
++                    .anchor_y = a,
++                    .pan_x = p,
++                    .pan_y = -p,
++                }, w, h);
++                const top_left = z.forward(0, 0);
++                const bottom_right = z.forward(w, h);
++                try testing.expect(top_left.x <= 1e-9);
++                try testing.expect(top_left.y <= 1e-9);
++                try testing.expect(bottom_right.x >= w - 1e-9);
++                try testing.expect(bottom_right.y >= h - 1e-9);
++            }
++        }
++    }
++}
++
++test "pane zoom: a pan inside the range is kept" {
++    // At 2x about the center the picture can move 400 px each way.
++    const z = resolve(.{
++        .scale = 2,
++        .anchor_x = 400,
++        .anchor_y = 300,
++        .pan_x = -399,
++        .pan_y = 299,
++    }, 800, 600);
++    try testing.expectEqual(@as(f64, -399), z.pan_x);
++    try testing.expectEqual(@as(f64, 299), z.pan_y);
++    const edge = resolve(.{ .scale = 2, .anchor_x = 400, .pan_x = 401 }, 800, 600);
++    try testing.expectEqual(@as(f64, 400), edge.pan_x);
++}
++
++test "pane zoom: inverse is the inverse of forward" {
++    const z = resolve(.{
++        .scale = 2.5,
++        .anchor_x = 170,
++        .anchor_y = 430,
++        .pan_x = -60,
++        .pan_y = 75,
++    }, 800, 600);
++    const points = [_][2]f64{ .{ 0, 0 }, .{ 800, 600 }, .{ 13.25, 590 }, .{ 401, 17 } };
++    for (points) |pt| {
++        const there = z.forward(pt[0], pt[1]);
++        const back = z.inverse(there.x, there.y);
++        try testing.expectApproxEqAbs(pt[0], back.x, 1e-9);
++        try testing.expectApproxEqAbs(pt[1], back.y, 1e-9);
++        const screen = z.inverse(pt[0], pt[1]);
++        const again = z.forward(screen.x, screen.y);
++        try testing.expectApproxEqAbs(pt[0], again.x, 1e-9);
++        try testing.expectApproxEqAbs(pt[1], again.y, 1e-9);
++    }
++}
++
++test "pane zoom: each cell drawn zoomed hit tests to that cell" {
++    const s: size.Size = .{
++        .screen = .{ .width = 1610, .height = 1034 },
++        .cell = .{ .width = 16, .height = 34 },
++        .padding = .{ .top = 8, .bottom = 8, .left = 5, .right = 5 },
++    };
++    const grid = s.grid();
++    const z = resolve(.{
++        .scale = 3,
++        .anchor_x = 700,
++        .anchor_y = 300,
++        .pan_x = 90,
++        .pan_y = -40,
++    }, @floatFromInt(s.screen.width), @floatFromInt(s.screen.height));
++
++    // The center of every cell, drawn zoomed, hit tests to that cell.
++    var row: u32 = 0;
++    while (row < grid.rows) : (row += 1) {
++        var col: u32 = 0;
++        while (col < grid.columns) : (col += 1) {
++            const cx: f64 = @floatFromInt(s.padding.left + col * s.cell.width + s.cell.width / 2);
++            const cy: f64 = @floatFromInt(s.padding.top + row * s.cell.height + s.cell.height / 2);
++            const drawn = z.forward(cx, cy);
++            const base = z.inverse(drawn.x, drawn.y);
++            const coord: size.Coordinate = .{ .surface = base };
++            const cell = coord.convert(.grid, s).grid;
++            try testing.expectEqual(col, cell.x);
++            try testing.expectEqual(row, cell.y);
++        }
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
