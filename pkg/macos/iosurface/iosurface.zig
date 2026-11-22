@@ -83,6 +83,29 @@ pub const IOSurface = opaque {
         );
     }
 
+    /// The purgeable states of IOSurfaceSetPurgeable.
+    pub const Purgeable = enum(u32) {
+        /// The system keeps the memory.
+        non_volatile = 0,
+        /// The system can take the memory when it needs it. The
+        /// memory does not count in the footprint of the process.
+        @"volatile" = 1,
+        /// The system took the memory: the contents are gone.
+        empty = 2,
+        /// Do not change the state, only read it.
+        keep_current = 3,
+        _,
+    };
+
+    /// Set the purgeable state of the surface. Returns the state before
+    /// the call: `empty` tells that the system took the memory of a
+    /// volatile surface and its contents are gone.
+    pub fn setPurgeable(self: *IOSurface, state: Purgeable) Purgeable {
+        var old: u32 = 0;
+        _ = c.IOSurfaceSetPurgeable(@ptrCast(self), @backingInt(state), &old);
+        return @fromBackingInt(old);
+    }
+
     pub inline fn lock(self: *IOSurface) void {
         c.IOSurfaceLock(
             @ptrCast(self),

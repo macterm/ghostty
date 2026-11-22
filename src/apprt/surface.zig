@@ -134,6 +134,11 @@ pub const Message = union(enum) {
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 
+    /// An APC sequence that no protocol recognizes ended (see
+    /// `apprt.action.UnknownApc`). The surface frees the request after
+    /// the action.
+    unknown_apc: UnknownApcReq,
+
     /// The terminal encountered a bell character.
     ring_bell,
 
@@ -151,6 +156,15 @@ pub const Message = union(enum) {
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
 
+    /// The child/pty produced output. This is a throttled heartbeat
+    /// emitted from the IO path (see Termio.processOutputLocked) so that
+    /// embedders can drive an activity indicator that keeps firing even
+    /// while the surface is occluded (the renderer, and therefore the
+    /// renderer-track .scrollbar signal, parks when occluded). The payload
+    /// carries the current scrollbar geometry so the consumer gets the
+    /// same information without a separate round trip.
+    output_activity: terminal.Scrollbar,
+
     /// Search progress update
     search_total: ?usize,
 
@@ -159,6 +173,11 @@ pub const Message = union(enum) {
 
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
+
+    pub const UnknownApcReq = struct {
+        data: WriteReq,
+        truncated: bool,
+    };
 
     pub const ReportTitleStyle = enum {
         csi_21_t,

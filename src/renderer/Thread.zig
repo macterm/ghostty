@@ -58,6 +58,13 @@ animation_wake: rendererpkg.Renderer.AnimationWake.Kind = .draw,
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
+/// The timer that makes idle render targets volatile (see
+/// `Renderer.markIdleTargets`). It runs after a draw, at the time a target
+/// can become idle.
+idle_h: xev.Timer,
+idle_c: xev.Completion = .{},
+idle_c_cancel: xev.Completion = .{},
+
 /// The timer used for cursor blinking
 cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
@@ -144,6 +151,10 @@ pub fn init(
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
 
+    // The timer for idle render targets.
+    var idle_h = try xev.Timer.init();
+    errdefer idle_h.deinit();
+
     // The mailbox for messaging this thread
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
@@ -157,6 +168,7 @@ pub fn init(
         .render_h = render_h,
         .draw_now = draw_now,
         .cursor_h = cursor_timer,
+        .idle_h = idle_h,
         .surface = surface,
         .renderer = renderer_impl,
         .state = state,
@@ -180,6 +192,7 @@ pub fn deinit(self: *Thread) void {
     self.render_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    self.idle_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
     self.loop.deinit();
@@ -469,6 +482,48 @@ fn drawFrame(self: *Thread, now: bool) void {
 
     self.renderer.drawFrame(false) catch |err|
         log.warn("error drawing err={}", .{err});
+
+    self.armIdleTimer();
+}
+
+/// Make the render targets that became idle volatile, and run the idle
+/// timer again at the time the next target can become idle.
+fn armIdleTimer(self: *Thread) void {
+    const delay_ms = self.renderer.markIdleTargets() orelse return;
+    self.idle_h.reset(
+        &self.loop,
+        &self.idle_c,
+        &self.idle_c_cancel,
+        delay_ms,
+        Thread,
+        self,
+        idleTimerCallback,
+    );
+}
+
+fn idleTimerCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // A draw ran the timer again (Timer.reset cancels the pending
+        // run). The new run carries on.
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error in idle target timer err={}", .{err});
+            return .disarm;
+        },
+    };
+    const t = self_ orelse return .disarm;
+
+    // A surface that is not visible has no swap chain (setVisible
+    // releases it), so there is nothing to mark.
+    if (!t.flags.visible) return .disarm;
+
+    t.armIdleTimer();
+    return .disarm;
 }
 
 fn wakeupCallback(
