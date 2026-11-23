@@ -310,6 +310,18 @@ pub const Uniforms = extern struct {
     cursor_trail: [4]f32 align(16) = @splat(0),
     cursor_trail_size: [4]f32 align(16) = @splat(0),
 
+    /// Pane zoom (`renderer.Zoom.View`), in grid pixels: a grid pixel `p`
+    /// draws at `zoom.xy * p + zoom.zw`. Every other position stays in
+    /// base grid pixels; the shaders apply this last, and its inverse
+    /// where they read a fragment's position. (1, 1, 0, 0) is no zoom.
+    zoom: [4]f32 align(16) = .{ 1, 1, 0, 0 },
+
+    /// The cell of the grid that rendered the glyphs: `.xy` is the scale
+    /// from its atlas pixels to screen pixels (1 for the zoomed glyph
+    /// grid, the zoom for base glyphs drawn zoomed, which are then
+    /// sampled linearly), `.zw` its cell size in atlas pixels.
+    glyph_cell: [4]f32 align(16) = .{ 1, 1, 0, 0 },
+
     pub const max_region_anims = 4;
     pub const max_ghost_rows = 64;
 

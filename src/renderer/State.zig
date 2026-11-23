@@ -35,7 +35,8 @@ mouse: Mouse = .{},
 
 /// The zoom of the picture as the host asked for it, in surface pixels
 /// (`Surface.setZoom`). Resolve it against the surface size before use
-/// (`renderer.Zoom.resolve`): a resize can make the pan too large.
+/// (`renderer.Zoom.view`, which the renderer draws with): a resize can
+/// make the pan too large.
 zoom: renderer.Zoom = .identity,
 
 /// Set by the surface as the first step of its teardown, before it joins

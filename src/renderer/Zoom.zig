@@ -98,6 +98,96 @@ pub fn inverse(self: Zoom, x: f64, y: f64) size.Coordinate.Surface {
     };
 }
 
+/// The zoom as the picture draws it on a surface of size `s`. The
+/// renderer draws with it, and the surface hit tests with it, so the two
+/// always agree.
+///
+/// A zoomed cell is a whole number of pixels, `round(scale x cell)` on
+/// each axis, so that box drawing and block glyphs tile with no gap. The
+/// scale on each axis is that cell over the base cell, so it can be a
+/// little different from the request (under 2% from 2x). The grid's
+/// top-left corner draws on a whole pixel, so a glyph from the zoomed
+/// glyph atlas lands on whole pixels too.
+pub fn view(request: Zoom, s: size.Size) View {
+    const width: f64 = @floatFromInt(s.screen.width);
+    const height: f64 = @floatFromInt(s.screen.height);
+    const z = request.resolve(width, height);
+    if (z.scale == 1 or s.cell.width == 0 or s.cell.height == 0) {
+        return .identity;
+    }
+
+    const cell = zoomedCell(z.scale, s.cell);
+    const sx = @as(f64, @floatFromInt(cell.width)) / @as(f64, @floatFromInt(s.cell.width));
+    const sy = @as(f64, @floatFromInt(cell.height)) / @as(f64, @floatFromInt(s.cell.height));
+    return .{
+        .scale = z.scale,
+        .scale_x = sx,
+        .scale_y = sy,
+        .offset_x = viewOffset(z.anchor_x, z.pan_x, sx, width, s.padding.left),
+        .offset_y = viewOffset(z.anchor_y, z.pan_y, sy, height, s.padding.top),
+    };
+}
+
+/// The whole-pixel size of a cell at `scale`.
+pub fn zoomedCell(scale: f64, cell: size.CellSize) size.CellSize {
+    return .{
+        .width = @intFromFloat(@round(scale * @as(f64, @floatFromInt(cell.width)))),
+        .height = @intFromFloat(@round(scale * @as(f64, @floatFromInt(cell.height)))),
+    };
+}
+
+/// The offset on one axis of `View`: the request's anchor and pan at the
+/// axis scale `s`, then moved by less than a pixel so that the grid's
+/// first cell (at `pad`) draws on a whole pixel. It stays in the range
+/// that keeps the surface covered: `offset <= 0` and
+/// `s * len + offset >= len`.
+fn viewOffset(anchor: f64, pan: f64, s: f64, len: f64, pad: u32) f64 {
+    const p: f64 = @floatFromInt(pad);
+    const lo = len * (1 - s);
+    const raw = std.math.clamp(anchor * (1 - s) + pan, lo, 0);
+    // Where the grid's first cell draws; a whole pixel if one is in range.
+    const first = s * p + raw;
+    const first_lo = @ceil(s * p + lo);
+    const first_hi = @floor(s * p);
+    if (first_lo > first_hi) return raw;
+    return std.math.clamp(@round(first), first_lo, first_hi) - s * p;
+}
+
+/// The zoom as drawn: a point `p` of the base surface draws at
+/// `scale_* * p + offset_*`. See `view`.
+pub const View = struct {
+    /// The scale of the request, after the clamp. The zoomed glyph atlas
+    /// is built at the font size times this.
+    scale: f64 = 1,
+    scale_x: f64 = 1,
+    scale_y: f64 = 1,
+    offset_x: f64 = 0,
+    offset_y: f64 = 0,
+
+    pub const identity: View = .{};
+
+    pub fn isIdentity(self: View) bool {
+        return self.scale_x == 1 and self.scale_y == 1 and
+            self.offset_x == 0 and self.offset_y == 0;
+    }
+
+    /// The point on screen where the picture draws the base point.
+    pub fn forward(self: View, x: f64, y: f64) size.Coordinate.Surface {
+        return .{
+            .x = self.scale_x * x + self.offset_x,
+            .y = self.scale_y * y + self.offset_y,
+        };
+    }
+
+    /// The base point that the picture draws at the screen point.
+    pub fn inverse(self: View, x: f64, y: f64) size.Coordinate.Surface {
+        return .{
+            .x = (x - self.offset_x) / self.scale_x,
+            .y = (y - self.offset_y) / self.scale_y,
+        };
+    }
+};
+
 test "pane zoom: identity changes no point" {
     const z = resolve(.{}, 800, 600);
     try testing.expect(z.isIdentity());
@@ -224,6 +314,106 @@ test "pane zoom: each cell drawn zoomed hit tests to that cell" {
             const cell = coord.convert(.grid, s).grid;
             try testing.expectEqual(col, cell.x);
             try testing.expectEqual(row, cell.y);
+        }
+    }
+}
+
+const test_size: size.Size = .{
+    .screen = .{ .width = 1610, .height = 1034 },
+    .cell = .{ .width = 16, .height = 34 },
+    .padding = .{ .top = 8, .bottom = 8, .left = 5, .right = 5 },
+};
+
+test "pane zoom: view of no zoom is the identity" {
+    try testing.expect(view(.{}, test_size).isIdentity());
+    try testing.expect(view(.{ .scale = 0.5 }, test_size).isIdentity());
+    var no_cell = test_size;
+    no_cell.cell = .{ .width = 0, .height = 0 };
+    try testing.expect(view(.{ .scale = 2 }, no_cell).isIdentity());
+}
+
+test "pane zoom: view cells are whole pixels" {
+    for ([_]f64{ 1.05, 1.1, 1.25, 1.5, 2, 2.37, 3 }) |sc| {
+        const v = view(.{ .scale = sc, .anchor_x = 300, .anchor_y = 200 }, test_size);
+        const cell = zoomedCell(sc, test_size.cell);
+        try testing.expectEqual(@as(f64, @floatFromInt(cell.width)), v.scale_x * 16);
+        try testing.expectEqual(@as(f64, @floatFromInt(cell.height)), v.scale_y * 34);
+        try testing.expectEqual(sc, v.scale);
+    }
+    // 1.1x of 16x34 is 17.6x37.4: drawn as 18x37.
+    const c = zoomedCell(1.1, test_size.cell);
+    try testing.expectEqual(@as(u32, 18), c.width);
+    try testing.expectEqual(@as(u32, 37), c.height);
+}
+
+test "pane zoom: view keeps the surface covered and the grid on whole pixels" {
+    const w: f64 = @floatFromInt(test_size.screen.width);
+    const h: f64 = @floatFromInt(test_size.screen.height);
+    const pans = [_]f64{ -10_000, -333.3, -1, 0, 0.4, 1, 271.7, 10_000 };
+    const anchors = [_]f64{ -50, 0, 123.4, 805, 1610, 2000 };
+    for ([_]f64{ 1.05, 1.1, 1.5, 2, 2.37, 3 }) |sc| {
+        for (anchors) |a| {
+            for (pans) |p| {
+                const v = view(.{
+                    .scale = sc,
+                    .anchor_x = a,
+                    .anchor_y = a / 2,
+                    .pan_x = p,
+                    .pan_y = -p,
+                }, test_size);
+                const tl = v.forward(0, 0);
+                const br = v.forward(w, h);
+                try testing.expect(tl.x <= 1e-9 and tl.y <= 1e-9);
+                try testing.expect(br.x >= w - 1e-9 and br.y >= h - 1e-9);
+                const first = v.forward(5, 8);
+                try testing.expectApproxEqAbs(@round(first.x), first.x, 1e-9);
+                try testing.expectApproxEqAbs(@round(first.y), first.y, 1e-9);
+            }
+        }
+    }
+}
+
+test "pane zoom: at a whole-pixel scale the view moves the request by less than a pixel" {
+    const req: Zoom = .{ .scale = 2, .anchor_x = 400.3, .anchor_y = 300.6, .pan_x = 10.2 };
+    const z = req.resolve(1610, 1034);
+    const v = view(req, test_size);
+    // At 2x the cell is exactly 32x68, so only the rounding moves it.
+    try testing.expectEqual(@as(f64, 2), v.scale_x);
+    try testing.expectEqual(@as(f64, 2), v.scale_y);
+    for ([_][2]f64{ .{ 0, 0 }, .{ 777, 555 } }) |pt| {
+        const a = z.forward(pt[0], pt[1]);
+        const b = v.forward(pt[0], pt[1]);
+        try testing.expect(@abs(a.x - b.x) <= 0.5 + 1e-9);
+        try testing.expect(@abs(a.y - b.y) <= 0.5 + 1e-9);
+    }
+}
+
+test "pane zoom: each cell the view draws hit tests to that cell" {
+    const grid = test_size.grid();
+    for ([_]f64{ 1.1, 2.37, 3 }) |sc| {
+        const v = view(.{
+            .scale = sc,
+            .anchor_x = 700,
+            .anchor_y = 300,
+            .pan_x = 90,
+            .pan_y = -40,
+        }, test_size);
+        var row: u32 = 0;
+        while (row < grid.rows) : (row += 1) {
+            var col: u32 = 0;
+            while (col < grid.columns) : (col += 1) {
+                // The center of the cell as drawn, from the zoomed cell size.
+                const cell = zoomedCell(sc, test_size.cell);
+                const origin = v.forward(5, 8);
+                const drawn_x = origin.x + @as(f64, @floatFromInt(col * cell.width)) +
+                    @as(f64, @floatFromInt(cell.width)) / 2;
+                const drawn_y = origin.y + @as(f64, @floatFromInt(row * cell.height)) +
+                    @as(f64, @floatFromInt(cell.height)) / 2;
+                const coord: size.Coordinate = .{ .surface = v.inverse(drawn_x, drawn_y) };
+                const hit = coord.convert(.grid, test_size).grid;
+                try testing.expectEqual(col, hit.x);
+                try testing.expectEqual(row, hit.y);
+            }
         }
     }
 }

@@ -907,6 +907,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         font_shaper: font.Shaper,
         font_shaper_cache: font.ShaperCache,
 
+        /// The zoom of the picture as drawn (`renderer.Zoom.view`), from
+        /// the request in the render state at each frame. Layout, shaping
+        /// and every position in the cells stay on `font_grid`; the
+        /// shaders apply the zoom last.
+        zoom_view: renderer.Zoom.View = .identity,
+
+        /// The glyphs of a zoomed picture: a grid at the font size times
+        /// the zoom, with whole-pixel cells, that renders the glyphs that
+        /// `font_grid` shaped. Null at 1x. Null while zoomed too, if it
+        /// could not be built: the base glyphs are then drawn scaled and
+        /// soft.
+        zoom_glyphs: ?*ZoomGlyphs = null,
+
+        /// The scale at which `zoom_glyphs` could not be built, so that it
+        /// is not tried again at each frame.
+        zoom_glyphs_failed: f64 = 1,
+
         /// The images that we may render.
         images: ImageState = .empty,
 
@@ -1592,6 +1609,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
+            if (self.zoom_glyphs) |z| {
+                z.grid.deinit(self.alloc);
+                z.modifiers.deinit(self.alloc);
+                self.alloc.destroy(z);
+            }
 
             self.config.deinit();
             self.api.deinit();
@@ -2553,6 +2575,185 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             display_link.setRunning(should_run);
         }
 
+        /// The pane zoom needs the zoom uniforms in the shaders. The Metal
+        /// shaders have them; the OpenGL shaders are not changed, so an
+        /// OpenGL renderer always draws at 1x.
+        const zoom_supported = @hasField(shaderpkg.Uniforms, "zoom");
+
+        /// See `zoom_glyphs`.
+        const ZoomGlyphs = struct {
+            grid: font.SharedGrid,
+            /// The metric modifiers of `grid` (`SharedGrid.initZoomed`).
+            modifiers: font.Metrics.ModifierSet = .{},
+            /// The zoom scale `grid` was built for.
+            scale: f64,
+        };
+
+        /// The grid that renders glyphs: the zoomed glyph grid while there
+        /// is one, else `font_grid`.
+        fn glyphGrid(self: *const Self) *font.SharedGrid {
+            return if (self.zoom_glyphs) |z| &z.grid else self.font_grid;
+        }
+
+        /// Render a glyph that `font_grid` shaped, from `glyphGrid`, with
+        /// the metrics of that grid. A font index that the zoomed glyph
+        /// grid does not have yet (the base found a new fallback face)
+        /// gets its face first.
+        fn renderGlyph(
+            self: *Self,
+            index: font.Collection.Index,
+            glyph_index: u32,
+            opts: font.Glyph.RenderOptions,
+        ) font.SharedGrid.RenderGlyphError!font.SharedGrid.Render {
+            const z = self.zoom_glyphs orelse {
+                var o = opts;
+                o.grid_metrics = self.grid_metrics;
+                return self.font_grid.renderGlyph(self.alloc, index, glyph_index, o);
+            };
+            var o = opts;
+            o.grid_metrics = z.grid.metrics;
+            return z.grid.renderGlyph(self.alloc, index, glyph_index, o) catch |err| switch (err) {
+                error.IndexOutOfBounds => {
+                    z.grid.mirror(self.alloc, self.font_grid) catch |mirror_err| {
+                        log.warn("error adding a face to the zoomed glyphs err={}", .{mirror_err});
+                        return err;
+                    };
+                    return z.grid.renderGlyph(self.alloc, index, glyph_index, o);
+                },
+                else => err,
+            };
+        }
+
+        /// `SharedGrid.renderCodepoint` through `renderGlyph`: `font_grid`
+        /// finds the face and the glyph, so that the zoomed glyph grid
+        /// never finds a face of its own.
+        fn renderCodepoint(
+            self: *Self,
+            cp: u32,
+            style: font.Style,
+            p: ?font.Presentation,
+            opts: font.Glyph.RenderOptions,
+        ) !?font.SharedGrid.Render {
+            const g = try self.font_grid.codepointGlyph(self.alloc, cp, style, p) orelse
+                return null;
+            return try self.renderGlyph(g.index, g.glyph_index, opts);
+        }
+
+        /// A distance in base pixels (a shaper offset) in the pixels of
+        /// the grid that renders glyphs: times the zoomed cell over the
+        /// base cell on each axis.
+        fn glyphPixels(self: *const Self, x: i32, y: i32) [2]i32 {
+            const z = self.zoom_glyphs orelse return .{ x, y };
+            const sx = @as(f64, @floatFromInt(z.grid.metrics.cell_width)) /
+                @as(f64, @floatFromInt(self.grid_metrics.cell_width));
+            const sy = @as(f64, @floatFromInt(z.grid.metrics.cell_height)) /
+                @as(f64, @floatFromInt(self.grid_metrics.cell_height));
+            return .{
+                @intFromFloat(@round(@as(f64, @floatFromInt(x)) * sx)),
+                @intFromFloat(@round(@as(f64, @floatFromInt(y)) * sy)),
+            };
+        }
+
+        /// Make each frame copy the atlas textures again at its next draw,
+        /// after the grid that renders glyphs changed.
+        fn resetAtlasStamps(self: *Self) void {
+            if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
+                frame.grayscale_modified = 0;
+                frame.color_modified = 0;
+            };
+        }
+
+        /// Free the zoomed glyph grid. Caller must hold the draw mutex.
+        fn dropZoomGlyphs(self: *Self) void {
+            const z = self.zoom_glyphs orelse return;
+            z.grid.deinit(self.alloc);
+            z.modifiers.deinit(self.alloc);
+            self.alloc.destroy(z);
+            self.zoom_glyphs = null;
+            self.resetAtlasStamps();
+            self.markDirty();
+        }
+
+        fn buildZoomGlyphs(self: *Self, scale: f64) !void {
+            const z = try self.alloc.create(ZoomGlyphs);
+            errdefer self.alloc.destroy(z);
+            z.* = .{ .grid = undefined, .scale = scale };
+            errdefer z.modifiers.deinit(self.alloc);
+            const cell = renderer.Zoom.zoomedCell(scale, self.size.cell);
+            z.grid = try font.SharedGrid.initZoomed(
+                self.alloc,
+                self.font_grid,
+                scale,
+                cell.width,
+                cell.height,
+                &z.modifiers,
+            );
+            self.zoom_glyphs = z;
+            self.resetAtlasStamps();
+            self.markDirty();
+        }
+
+        /// Take the zoom the host asked for (`Surface.setZoom`) for this
+        /// frame: the drawn transform, and the zoomed glyph grid for its
+        /// scale. A change of the pan only changes uniforms. A change of
+        /// the scale builds a new glyph grid and rebuilds every cell (the
+        /// atlas positions change); a zoom back to 1x frees the grid.
+        ///
+        /// Caller must hold the draw mutex.
+        fn applyZoom(self: *Self, request: renderer.Zoom) void {
+            const view: renderer.Zoom.View = if (comptime zoom_supported)
+                request.view(self.size)
+            else
+                .identity;
+
+            if (self.zoom_glyphs) |z| {
+                if (z.scale != view.scale) self.dropZoomGlyphs();
+            }
+            if (view.scale == 1) self.zoom_glyphs_failed = 1;
+            if (view.scale != 1 and self.zoom_glyphs == null and
+                self.zoom_glyphs_failed != view.scale)
+            {
+                self.buildZoomGlyphs(view.scale) catch |err| {
+                    log.warn("error building the zoomed glyphs scale={} err={}", .{ view.scale, err });
+                    self.zoom_glyphs_failed = view.scale;
+                    // The base glyphs draw scaled, from other atlas positions.
+                    self.markDirty();
+                };
+            }
+
+            self.zoom_view = view;
+            self.updateZoomUniforms();
+        }
+
+        /// Update the uniforms of the pane zoom from `zoom_view` and the
+        /// grid that renders glyphs. Caller must hold the draw mutex.
+        fn updateZoomUniforms(self: *Self) void {
+            if (comptime !zoom_supported) return;
+            const v = self.zoom_view;
+            const pad_x: f64 = @floatFromInt(self.size.padding.left);
+            const pad_y: f64 = @floatFromInt(self.size.padding.top);
+            // In grid pixels: a grid pixel p draws at scale * p + offset.
+            self.uniforms.zoom = .{
+                @floatCast(v.scale_x),
+                @floatCast(v.scale_y),
+                @floatCast(v.offset_x + (v.scale_x - 1) * pad_x),
+                @floatCast(v.offset_y + (v.scale_y - 1) * pad_y),
+            };
+            // A glyph is drawn at the zoom, from atlas pixels of the cell
+            // size of the grid that rendered it.
+            const grid = self.glyphGrid();
+            const base_w: f64 = @floatFromInt(self.grid_metrics.cell_width);
+            const base_h: f64 = @floatFromInt(self.grid_metrics.cell_height);
+            const glyph_w: f64 = @floatFromInt(grid.metrics.cell_width);
+            const glyph_h: f64 = @floatFromInt(grid.metrics.cell_height);
+            self.uniforms.glyph_cell = .{
+                @floatCast(v.scale_x * base_w / glyph_w),
+                @floatCast(v.scale_y * base_h / glyph_h),
+                @floatCast(glyph_w),
+                @floatCast(glyph_h),
+            };
+        }
+
         /// Set the new font grid.
         ///
         /// Must be called on the render thread.
@@ -2560,7 +2761,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
-            // Update our grid
+            // Update our grid. The zoomed glyphs mirror the old grid; the
+            // next frame builds them again from this one.
+            self.dropZoomGlyphs();
+            self.zoom_glyphs_failed = 1;
             self.font_grid = grid;
 
             // Update all our textures so that they sync on the next frame.
@@ -2611,6 +2815,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(self.grid_metrics.cell_width),
                 @floatFromInt(self.grid_metrics.cell_height),
             };
+            self.updateZoomUniforms();
         }
 
         /// Update the frame data.
@@ -2649,6 +2854,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                zoom: renderer.Zoom,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -2839,6 +3045,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .zoom = state.zoom,
                 };
             };
 
@@ -2927,6 +3134,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
+
+                // The zoom first: a new zoomed glyph grid makes the cells
+                // below rebuild from it.
+                self.applyZoom(critical.zoom);
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -3209,22 +3420,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.bg_image_buffer_modified = self.bg_image_buffer_modified;
             }
 
-            // If our font atlas changed, sync the texture data
+            // If our font atlas changed, sync the texture data. The atlas
+            // is the zoomed glyph grid's while the picture is zoomed.
+            const glyph_grid = self.glyphGrid();
             texture: {
-                const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
+                const modified = glyph_grid.atlas_grayscale.modified.load(.monotonic);
                 if (modified <= frame.grayscale_modified) break :texture;
-                self.font_grid.lock.lockSharedUncancelable(global.io());
-                defer self.font_grid.lock.unlockShared(global.io());
-                frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
-                try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
+                glyph_grid.lock.lockSharedUncancelable(global.io());
+                defer glyph_grid.lock.unlockShared(global.io());
+                frame.grayscale_modified = glyph_grid.atlas_grayscale.modified.load(.monotonic);
+                try self.syncAtlasTexture(&glyph_grid.atlas_grayscale, &frame.grayscale);
             }
             texture: {
-                const modified = self.font_grid.atlas_color.modified.load(.monotonic);
+                const modified = glyph_grid.atlas_color.modified.load(.monotonic);
                 if (modified <= frame.color_modified) break :texture;
-                self.font_grid.lock.lockSharedUncancelable(global.io());
-                defer self.font_grid.lock.unlockShared(global.io());
-                frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
-                try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
+                glyph_grid.lock.lockSharedUncancelable(global.io());
+                defer glyph_grid.lock.unlockShared(global.io());
+                frame.color_modified = glyph_grid.atlas_color.modified.load(.monotonic);
+                try self.syncAtlasTexture(&glyph_grid.atlas_color, &frame.color);
             }
 
             // Get a frame context from the graphics API.
@@ -4845,8 +5058,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .curly => .underline_curly,
             };
 
-            const render = try self.font_grid.renderGlyph(
-                self.alloc,
+            const render = try self.renderGlyph(
                 font.sprite_index,
                 @backingInt(sprite),
                 .{
@@ -4876,8 +5088,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
-            const render = try self.font_grid.renderGlyph(
-                self.alloc,
+            const render = try self.renderGlyph(
                 font.sprite_index,
                 @backingInt(font.Sprite.overline),
                 .{
@@ -4907,8 +5118,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
-            const render = try self.font_grid.renderGlyph(
-                self.alloc,
+            const render = try self.renderGlyph(
                 font.sprite_index,
                 @backingInt(font.Sprite.strikethrough),
                 .{
@@ -4946,8 +5156,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cp = cell.codepoint();
 
             // Render
-            const render = try self.font_grid.renderGlyph(
-                self.alloc,
+            const render = try self.renderGlyph(
                 shaper_run.font_index,
                 shaper_cell.glyph_index,
                 .{
@@ -4976,6 +5185,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
 
+            // The shaper's offsets are in base pixels; a zoomed glyph's
+            // bearings are in the pixels of the grid that rendered it.
+            const shaper_offset = self.glyphPixels(shaper_cell.x_offset, shaper_cell.y_offset);
+
             try self.cells.add(self.alloc, .text, .{
                 .atlas = switch (render.presentation) {
                     .emoji => .color,
@@ -4987,8 +5200,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
-                    @intCast(render.glyph.offset_x + shaper_cell.x_offset),
-                    @intCast(render.glyph.offset_y + shaper_cell.y_offset),
+                    @intCast(render.glyph.offset_x + shaper_offset[0]),
+                    @intCast(render.glyph.offset_y + shaper_offset[1]),
                 },
             });
         }
@@ -5049,8 +5262,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .lock => unreachable,
                     };
 
-                    break :render self.font_grid.renderGlyph(
-                        self.alloc,
+                    break :render self.renderGlyph(
                         font.sprite_index,
                         @backingInt(sprite),
                         .{
@@ -5063,8 +5275,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 },
 
-                .lock => self.font_grid.renderCodepoint(
-                    self.alloc,
+                .lock => self.renderCodepoint(
                     0xF023, // lock symbol
                     .regular,
                     .text,
@@ -5086,16 +5297,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (tracked) {
                 const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
                 const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                // The rect is in base grid pixels, as the shaders take it,
+                // so while the glyphs are zoomed it comes from the base
+                // grid's sprite.
+                const glyph: font.Glyph = if (self.zoom_glyphs == null) render.glyph else base: {
+                    const sprite: font.Sprite = switch (cursor_style) {
+                        .block => .cursor_rect,
+                        .bar => .cursor_bar,
+                        .underline => .cursor_underline,
+                        .block_hollow, .lock => unreachable,
+                    };
+                    const base = self.font_grid.renderGlyph(
+                        self.alloc,
+                        font.sprite_index,
+                        @backingInt(sprite),
+                        .{
+                            .cell_width = if (wide) 2 else 1,
+                            .grid_metrics = self.grid_metrics,
+                        },
+                    ) catch |err| {
+                        log.warn("error rendering cursor glyph err={}", .{err});
+                        return;
+                    };
+                    break :base base.glyph;
+                };
                 // The sprite's rect in grid pixels: the X bearing is the
                 // distance from the cell's left edge, the Y bearing from
                 // the cell's bottom edge to the sprite's top.
                 const rect: [4]f32 = .{
                     @as(f32, @floatFromInt(x)) * cell_w +
-                        @as(f32, @floatFromInt(render.glyph.offset_x)),
+                        @as(f32, @floatFromInt(glyph.offset_x)),
                     @as(f32, @floatFromInt(cursor_vp.y)) * cell_h + cell_h -
-                        @as(f32, @floatFromInt(render.glyph.offset_y)),
-                    @floatFromInt(render.glyph.width),
-                    @floatFromInt(render.glyph.height),
+                        @as(f32, @floatFromInt(glyph.offset_y)),
+                    @floatFromInt(glyph.width),
+                    @floatFromInt(glyph.height),
                 };
                 const cell: [2]u16 = .{ @intCast(x), @intCast(cursor_vp.y) };
                 if (self.cursor_glide) |*glide| {
@@ -5134,8 +5369,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             screen_fg: terminal.color.RGB,
         ) !void {
             // Render the glyph for our preedit text
-            const render_ = self.font_grid.renderCodepoint(
-                self.alloc,
+            const render_ = self.renderCodepoint(
                 @intCast(cp.codepoint),
                 .regular,
                 .text,

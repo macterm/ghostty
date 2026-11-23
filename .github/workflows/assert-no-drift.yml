@@ -77,6 +77,7 @@ env:
     .github/downstream/0023-resolve-launch.patch
     .github/downstream/0024-idle-targets-volatile.patch
     .github/downstream/0025-pane-zoom.patch
+    .github/downstream/0026-zoom-glyph-grid.patch
   # How far behind upstream HEAD the fork's base may fall before the sync is
   # presumed broken. A daily sync should keep this at 0–1 days.
   MAX_AGE_DAYS: "4"

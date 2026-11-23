@@ -87,7 +87,8 @@ jobs:
       # the callbacks). "launch:" covers patch 0023 (the resolved launch of
       # the exec backend). "IdleTargets" covers patch 0024 (the render
       # targets that become volatile while the surface is idle). "pane zoom"
-      # covers patch 0025 (the zoom of a surface's picture).
+      # covers patch 0025 (the zoom of a surface's picture) and patch 0026
+      # (the zoomed glyph grid).
       #
       # The seed is set here so that the next step can use it again.
       - name: Test downstream patches
