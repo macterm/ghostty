@@ -1665,7 +1665,7 @@ test "pane zoom: a mirror has the base's faces in order, at its size" {
     });
     _ = try c.add(alloc, try .init(
         lib,
-        font.embedded.emoji,
+        font.embedded.symbols_nerd_font,
         .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
     ), .{
         .style = .regular,
@@ -1692,7 +1692,7 @@ test "pane zoom: a mirror has the base's faces in order, at its size" {
     }
 
     // The same lookups give the same index.
-    for ([_]u32{ 'A', 0x1F600 }) |cp| {
+    for ([_]u32{ 'A', 0xF023 }) |cp| {
         for (std.enums.values(Style)) |style| {
             try testing.expectEqual(
                 c.getIndex(cp, style, .{ .any = {} }),
