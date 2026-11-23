@@ -2353,7 +2353,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
     // rendering only renders in a single line.
     const height: f64 = height: {
         var height: f64 = @floatFromInt(self.size.cell.height);
-        height *= z.scale;
+        height *= z.scale_y;
         height /= scale.y;
         break :height height;
     };
@@ -2373,7 +2373,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
         // that is so I'm going to just leave this comment here so its known
         // that I left this out on purpose pending more investigation.
 
-        break :width width * z.scale;
+        break :width width * z.scale_x;
     };
 
     return .{
@@ -5065,30 +5065,33 @@ fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
     return .{ .x = grid.x, .y = grid.y };
 }
 
-/// The zoom of the picture (`renderer.Zoom`), resolved for the surface's
-/// size. A pointer becomes a cell through its inverse: `posToViewport`,
+/// The zoom of the picture as the renderer draws it (`renderer.Zoom.view`):
+/// resolved for the surface's size, with whole-pixel zoomed cells. A pointer becomes a cell through its inverse: `posToViewport`,
 /// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
 /// keeps its y on screen, so a drag past the edge still scrolls. A cell
 /// becomes a point for the host through its forward: `imePointScaled`
 /// and the text point of `dumpTextLocked`.
 ///
 /// Precondition: the render_state mutex must be held.
-fn zoom(self: *const Surface) rendererpkg.Zoom {
-    return self.renderer_state.zoom.resolve(
-        @floatFromInt(self.size.screen.width),
-        @floatFromInt(self.size.screen.height),
-    );
+fn zoom(self: *const Surface) rendererpkg.Zoom.View {
+    return self.renderer_state.zoom.view(self.size);
 }
 
 /// Set the zoom of the picture, in surface pixels: `scale` about the
 /// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
 /// A scale of 1 is no zoom. The values are kept as given and clamped at
 /// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
-/// font size, the grid and the pty size do not change.
+/// font size, the grid and the pty size do not change. The renderer
+/// draws the next frame with it.
 pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
-    self.renderer_state.zoom = request;
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.zoom = request;
+    }
+    self.queueRender() catch |err| {
+        log.warn("error queueing a render after a zoom err={}", .{err});
+    };
 }
 
 /// How far below its row-aligned position the renderer draws the

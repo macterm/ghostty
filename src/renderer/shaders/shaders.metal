@@ -60,12 +60,44 @@ struct Uniforms {
   // (.z); opacity 0 while there is none. Drawn in cursor_fill's color.
   float4 cursor_trail;
   float4 cursor_trail_size;
+  // Pane zoom, in grid pixels: grid pixel p draws at zoom.xy * p +
+  // zoom.zw. Every other position here is in base grid pixels; the zoom
+  // applies last (zoom_grid), and its inverse where a fragment's position
+  // is read (screen_grid). (1, 1, 0, 0) is no zoom. The GLSL shaders do
+  // not have it: Macterm draws with Metal only.
+  float4 zoom;
+  // The cell of the grid that rendered the glyphs: .xy is the scale from
+  // its atlas pixels to screen pixels (1 for the zoomed glyph grid; the
+  // zoom for base glyphs drawn zoomed, which are sampled linearly), .zw
+  // its cell size in atlas pixels.
+  float4 glyph_cell;
 };
+
+// Pane zoom: where grid pixel p draws, in grid pixels of the screen.
+float2 zoom_grid(constant Uniforms& uniforms, float2 p) {
+  return p * uniforms.zoom.xy + uniforms.zoom.zw;
+}
+
+// Pane zoom: the grid pixel that a drawn position ([[position]], in
+// screen pixels) shows. The inverse of zoom_grid, without the padding.
+// Every fragment that compares its position with the grid goes through
+// this.
+float2 screen_grid(constant Uniforms& uniforms, float2 position) {
+  return (position - uniforms.grid_padding.wx - uniforms.zoom.zw) /
+      uniforms.zoom.xy;
+}
+
+// Pane zoom: how many screen pixels one grid pixel is, for the width of
+// an antialiased edge, which is one screen pixel.
+float zoom_px(constant Uniforms& uniforms) {
+  return 0.5 * (uniforms.zoom.x + uniforms.zoom.y);
+}
 
 // Cursor trail: the streak's opacity at grid pixel p. An axis-aligned box
 // of the trail's half size swept along its segment (it slides rather than
 // rotates, so a diagonal move leaves a slanted streak with square ends),
-// with a one-pixel antialiased edge, times the streak's opacity.
+// with a one-pixel antialiased edge (a screen pixel, so zoom_px grid
+// pixels wide in a zoomed picture), times the streak's opacity.
 float trail_coverage(constant Uniforms& uniforms, float2 p) {
   float4 s = uniforms.cursor_trail_size;
   if (s.z <= 0.0) return 0.0;
@@ -75,7 +107,7 @@ float trail_coverage(constant Uniforms& uniforms, float2 p) {
   float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
   float2 d = abs(p - (a + ab * h)) - s.xy;
   float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-  return (1.0 - smoothstep(0.0, 1.0, dist)) * s.z;
+  return (1.0 - smoothstep(0.0, 1.0, dist * zoom_px(uniforms))) * s.z;
 }
 
 // Cursor morph: the signed distance from p to the comet, a disc of
@@ -100,11 +132,12 @@ float rect_distance(float2 p, float4 r) {
   return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
 }
 
-// Smooth cursor: how much of the 1x1 pixel centered on grid pixel p lies
-// inside cursor_rect. Exact box coverage, so a resting cursor on whole
-// pixels is as hard-edged as the sprite it replaces and only an edge in
-// motion blends. Under cursor morph, the rect mixed with the comet by
-// their distances, with a one-pixel antialiased edge.
+// Smooth cursor: how much of the screen pixel centered on grid pixel p
+// lies inside cursor_rect. A screen pixel is 1x1 grid pixels, or 1/zoom
+// of that in a zoomed picture. Exact box coverage, so a resting cursor on
+// whole pixels is as hard-edged as the sprite it replaces and only an
+// edge in motion blends. Under cursor morph, the rect mixed with the
+// comet by their distances, with a one-pixel antialiased edge.
 float cursor_coverage(constant Uniforms& uniforms, float2 p) {
   float4 r = uniforms.cursor_rect;
   if (r.z <= 0.0 || r.w <= 0.0) return 0.0;
@@ -112,21 +145,22 @@ float cursor_coverage(constant Uniforms& uniforms, float2 p) {
   if (s.z > 0.0) {
     float4 c = uniforms.cursor_comet;
     float d = mix(rect_distance(p, r), comet_distance(p, c.xy, c.zw, s.x, s.y), s.z);
-    return clamp(0.5 - d, 0.0, 1.0);
+    return clamp(0.5 - d * zoom_px(uniforms), 0.0, 1.0);
   }
   float2 lo = r.xy;
   float2 hi = r.xy + r.zw;
-  float2 c = clamp(min(hi, p + 0.5) - max(lo, p - 0.5), 0.0, 1.0);
+  float2 h = 0.5 / uniforms.zoom.xy;
+  float2 c = clamp(min(hi, p + h) - max(lo, p - h), 0.0, 2.0 * h) / (2.0 * h);
   return c.x * c.y;
 }
 
-// A drawn position back on the grid's pixels: minus the padding and the
-// smooth-scroll shift. A region scroll's shift stays in, as it is in
-// cursor_rect.
+// A drawn position back on the grid's pixels: minus the padding, the
+// pane zoom and the smooth-scroll shift. A region scroll's shift stays
+// in, as it is in cursor_rect.
 float2 grid_pixel(constant Uniforms& uniforms, float2 position) {
   float shift_y = uniforms.scroll_offset.x -
       uniforms.scroll_offset.y * uniforms.cell_size.y;
-  return position - uniforms.grid_padding.wx - float2(0.0, shift_y);
+  return screen_grid(uniforms, position) - float2(0.0, shift_y);
 }
 
 // The region scroll animation a grid cell takes part in, or -1. `pos` is
@@ -670,7 +704,7 @@ fragment float4 cell_bg_fragment(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *cells [[buffer(2)]]
 ) {
-  float2 rel = in.position.xy - uniforms.grid_padding.wx;
+  float2 rel = screen_grid(uniforms, in.position.xy);
   float extra_rows = uniforms.scroll_offset.x != 0.0
       ? max(uniforms.scroll_offset.y + uniforms.scroll_offset.w, 1.0)
       : 0.0;
@@ -842,14 +876,21 @@ vertex CellTextVertexOut cell_text_vertex(
   // the y offset. The X bearing is the distance from the left of the cell
   // to the left of the glyph, so it works as the x offset directly.
 
-  float2 size = float2(in.glyph_size);
+  //
+  // Pane zoom: the cell's corner moves with the zoom (zoom_grid), and the
+  // glyph's size and bearings are in pixels of the cell it was rendered
+  // for (glyph_cell). The zoomed glyph grid renders them at the zoom, so
+  // they are screen pixels as they are (glyph_cell.xy is 1).
+
+  float2 size = float2(in.glyph_size) * uniforms.glyph_cell.xy;
   float2 offset = float2(in.bearings);
 
-  offset.y = uniforms.cell_size.y - offset.y;
+  offset.y = uniforms.glyph_cell.w - offset.y;
+  offset *= uniforms.glyph_cell.xy;
 
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
-  cell_pos = cell_pos + size * corner + offset;
+  cell_pos = zoom_grid(uniforms, cell_pos) + size * corner + offset;
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
@@ -914,16 +955,25 @@ fragment float4 cell_text_fragment(
   texture2d<float> textureColor [[texture(1)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
-  constexpr sampler textureSampler(
+  constexpr sampler nearestSampler(
     coord::pixel,
     address::clamp_to_edge,
     filter::nearest
   );
+  constexpr sampler linearSampler(
+    coord::pixel,
+    address::clamp_to_edge,
+    filter::linear
+  );
+  // Pane zoom: glyphs drawn at another size than their atlas pixels (the
+  // base glyphs, while there is no zoomed glyph grid) are sampled
+  // linearly, so they are soft, not blocky.
+  bool scaled = any(uniforms.glyph_cell.xy != float2(1.0));
 
   // Region scroll animation: a glyph sliding in or out of its region
   // stops at the region's edge.
   {
-    float2 rel = in.position.xy - uniforms.grid_padding.wx;
+    float2 rel = screen_grid(uniforms, in.position.xy);
     if (rel.x < in.clip.x || rel.x >= in.clip.z ||
         rel.y < in.clip.y || rel.y >= in.clip.w) {
       discard_fragment();
@@ -934,7 +984,7 @@ fragment float4 cell_text_fragment(
   // clip it to the visible grid. Only while shifted, so glyphs that
   // legitimately overhang a cell edge are untouched at rest.
   if (uniforms.scroll_offset.x != 0.0) {
-    float y = in.position.y - uniforms.grid_padding.x;
+    float y = screen_grid(uniforms, in.position.xy).y;
     float extra_rows = max(uniforms.scroll_offset.y + uniforms.scroll_offset.w, 1.0);
     float visible_h =
         (float(uniforms.grid_size.y) - extra_rows) * uniforms.cell_size.y +
@@ -975,7 +1025,9 @@ fragment float4 cell_text_fragment(
       }
 
       // Fetch our alpha mask for this pixel.
-      float a = textureGrayscale.sample(textureSampler, in.tex_coord).r;
+      float a = scaled
+          ? textureGrayscale.sample(linearSampler, in.tex_coord).r
+          : textureGrayscale.sample(nearestSampler, in.tex_coord).r;
 
       // Linear blending weight correction corrects the alpha value to
       // produce blending results which match gamma-incorrect blending.
@@ -1012,7 +1064,9 @@ fragment float4 cell_text_fragment(
     case ATLAS_COLOR: {
       // For now, we assume that color glyphs
       // are already premultiplied linear colors.
-      float4 color = textureColor.sample(textureSampler, in.tex_coord);
+      float4 color = scaled
+          ? textureColor.sample(linearSampler, in.tex_coord)
+          : textureColor.sample(nearestSampler, in.tex_coord);
 
       // If we're doing linear blending, we can return this right away.
       if (uniforms.use_linear_blending) {
@@ -1096,6 +1150,9 @@ vertex ImageVertexOut image_vertex(
   // Smooth scrolling: image placements are in terminal viewport rows,
   // so they move by the sub-row offset alone.
   image_pos.y += uniforms.scroll_offset.x;
+
+  // Pane zoom: an image scales at its own resolution (linear sampling).
+  image_pos = zoom_grid(uniforms, image_pos);
 
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);

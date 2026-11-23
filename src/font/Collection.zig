@@ -568,6 +568,126 @@ pub fn setSize(
     try self.updateMetrics();
 }
 
+/// True if this build can mirror a collection (`initMirror`). Only the
+/// CoreText faces can be copied at a new size.
+pub const mirror_supported = font.Discover == font.discovery.CoreText and
+    @hasDecl(Face, "initFontCopy");
+
+pub const MirrorError = Allocator.Error || error{
+    /// This build cannot copy faces (`mirror_supported`).
+    MirrorUnsupported,
+    /// `load_options` is null.
+    DeferredLoadingUnavailable,
+    /// An alias of the base points to an entry that is not in the base.
+    MirrorAliasNotFound,
+    /// A face could not be copied at the new size.
+    MirrorFaceFailed,
+};
+
+/// A collection with the faces of `base` in the same order, each at
+/// `size` (times its own scale factor, as in `setSize`), and no metric
+/// modifiers. A zoomed glyph grid draws with it: the base grid shapes
+/// the text, so a font index must name the same face in both. A grid of
+/// its own (`SharedGridSet.ref`) lists its faces in the order its own
+/// lookups found them, so its indices can name other faces.
+///
+/// `base` must not change while this runs: hold its grid's lock.
+pub fn initMirror(
+    alloc: Allocator,
+    base: *Collection,
+    size: DesiredSize,
+) MirrorError!Collection {
+    var opts = base.load_options orelse return error.DeferredLoadingUnavailable;
+    opts.size = size;
+
+    var result: Collection = .init();
+    result.load_options = opts;
+    errdefer result.deinit(alloc);
+    try result.mirror(alloc, base);
+    return result;
+}
+
+/// Add the entries of `base` that this mirror does not have yet, in the
+/// order of `base` (see `initMirror`). The base finds a new fallback face
+/// when its text first needs one, so a mirror calls this again when the
+/// base has an index that it does not have.
+///
+/// `base` must not change while this runs: hold its grid's lock.
+pub fn mirror(
+    self: *Collection,
+    alloc: Allocator,
+    base: *Collection,
+) MirrorError!void {
+    if (comptime !mirror_supported) return error.MirrorUnsupported;
+    const opts = self.load_options orelse return error.DeferredLoadingUnavailable;
+
+    // An alias points into an earlier style (bold italic to bold, the
+    // others to regular), so the styles are mirrored in order.
+    for (std.enums.values(Style)) |style| {
+        const src = base.faces.getPtr(style);
+        const dst = self.faces.getPtr(style);
+        while (dst.count() < src.count()) {
+            const item: EntryOrAlias = switch (src.at(dst.count()).*) {
+                .alias => |target| .{ .alias = try self.mirrorOf(base, target) },
+                .entry => |*entry| .{ .entry = try mirrorEntry(entry, opts) },
+            };
+            dst.append(alloc, item) catch |err| {
+                var it = item;
+                if (it == .entry) it.entry.deinit();
+                return err;
+            };
+        }
+    }
+}
+
+/// The entry of this mirror at the place that `target` has in `base`.
+fn mirrorOf(self: *Collection, base: *Collection, target: *Entry) MirrorError!*Entry {
+    for (std.enums.values(Style)) |style| {
+        const src = base.faces.getPtr(style);
+        const dst = self.faces.getPtr(style);
+        var i: usize = 0;
+        while (i < src.count()) : (i += 1) {
+            const item = src.at(i);
+            if (item.* != .entry or &item.entry != target) continue;
+            if (i >= dst.count()) return error.MirrorAliasNotFound;
+            return dst.at(i).getEntry();
+        }
+    }
+    return error.MirrorAliasNotFound;
+}
+
+/// A copy of `entry` at the size of `opts`. A deferred face stays
+/// deferred; a loaded face is copied at its own scale of that size.
+fn mirrorEntry(entry: *Entry, opts: LoadOptions) MirrorError!Entry {
+    const face: Entry.AnyFace = switch (entry.face) {
+        .deferred => |d| deferred: {
+            var copy = d;
+            copy.ct.?.font.retain();
+            break :deferred .{ .deferred = copy };
+        },
+        .loaded => |*f| loaded: {
+            var face_opts = opts;
+            face_opts.size.points *= @floatCast(switch (entry.scale_factor) {
+                .scale => |v| v,
+                .adjustment => 1.0,
+            });
+            var copy = Face.initFontCopy(f.font, face_opts.faceOptions()) catch
+                return error.MirrorFaceFailed;
+            // As `Face.syntheticBold` sets it for this size.
+            if (f.synthetic_bold != null) {
+                const points: f64 = @floatCast(face_opts.size.points);
+                copy.synthetic_bold = @max(points / 14.0, 1);
+            }
+            break :loaded .{ .loaded = copy };
+        },
+    };
+    return .{
+        .face = face,
+        .fallback = entry.fallback,
+        .scale_factor = entry.scale_factor,
+    };
+}
+
 /// Options for adjusting the size of a face relative to the primary face.
 pub const SizeAdjustment = enum {
     /// Don't adjust the size for this face, use the original point size.
@@ -1521,4 +1641,81 @@ test "face metrics" {
         wideMetrics.ascii_height,
         wideMetrics.icWidth(),
     );
+}
+
+test "pane zoom: a mirror has the base's faces in order, at its size" {
+    if (comptime !mirror_supported) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib, .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } };
+    _ = try c.add(alloc, try .init(
+        lib,
+        font.embedded.regular,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ), .{
+        .style = .regular,
+        .fallback = false,
+        .size_adjustment = .none,
+    });
+    _ = try c.add(alloc, try .init(
+        lib,
+        font.embedded.emoji,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ), .{
+        .style = .regular,
+        .fallback = true,
+        .size_adjustment = .none,
+    });
+    // Synthetic and aliased styles.
+    try c.completeStyles(alloc, .{});
+
+    var m = try initMirror(alloc, &c, .{ .points = 24, .xdpi = 96, .ydpi = 96 });
+    defer m.deinit(alloc);
+
+    for (std.enums.values(Style)) |style| {
+        const src = c.faces.getPtr(style);
+        const dst = m.faces.getPtr(style);
+        try testing.expectEqual(src.count(), dst.count());
+        var i: usize = 0;
+        while (i < src.count()) : (i += 1) {
+            const a = src.at(i);
+            const b = dst.at(i);
+            try testing.expectEqual(std.meta.activeTag(a.*), std.meta.activeTag(b.*));
+            try testing.expectEqual(a.getEntry().fallback, b.getEntry().fallback);
+        }
+    }
+
+    // The same lookups give the same index.
+    for ([_]u32{ 'A', 0x1F600 }) |cp| {
+        for (std.enums.values(Style)) |style| {
+            try testing.expectEqual(
+                c.getIndex(cp, style, .{ .any = {} }),
+                m.getIndex(cp, style, .{ .any = {} }),
+            );
+        }
+    }
+
+    // A face of the mirror is at twice the size.
+    const face = try m.getFace(.{ .idx = 0 });
+    try testing.expectEqual(@as(f32, 24), face.size.points);
+
+    // A face that the base adds later is mirrored on the next call.
+    _ = try c.add(alloc, try .init(
+        lib,
+        font.embedded.regular,
+        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
+    ), .{
+        .style = .regular,
+        .fallback = true,
+        .size_adjustment = .none,
+    });
+    try testing.expectError(error.IndexOutOfBounds, m.getEntry(.{ .idx = 2 }));
+    try m.mirror(alloc, &c);
+    _ = try m.getEntry(.{ .idx = 2 });
 }
