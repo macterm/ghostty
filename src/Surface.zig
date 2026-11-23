@@ -5066,9 +5066,10 @@ fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
 }
 
 /// The zoom of the picture as the renderer draws it (`renderer.Zoom.view`):
-/// resolved for the surface's size, with whole-pixel zoomed cells. A pointer becomes a cell through its inverse: `posToViewport`,
-/// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
-/// keeps its y on screen, so a drag past the edge still scrolls. A cell
+/// resolved for the surface's size, with whole-pixel zoomed cells. A
+/// pointer becomes a cell through its inverse: `posToViewport`, `posToPin`,
+/// `mouseReportPos`, and the x of a selection. A selection keeps its y on
+/// screen, so a drag past the edge still scrolls. A cell
 /// becomes a point for the host through its forward: `imePointScaled`
 /// and the text point of `dumpTextLocked`.
 ///
@@ -5079,8 +5080,8 @@ fn zoom(self: *const Surface) rendererpkg.Zoom.View {
 
 /// Set the zoom of the picture, in surface pixels: `scale` about the
 /// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
-/// A scale of 1 is no zoom. The values are kept as given and clamped at
-/// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
+/// A scale of 1 is no zoom. The values are kept as given and resolved at
+/// each use (`renderer.Zoom.view`). This writes only the zoom: the
 /// font size, the grid and the pty size do not change. The renderer
 /// draws the next frame with it.
 pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {

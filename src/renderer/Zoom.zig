@@ -373,7 +373,7 @@ test "pane zoom: view keeps the surface covered and the grid on whole pixels" {
     }
 }
 
-test "pane zoom: view moves the request by less than a pixel" {
+test "pane zoom: at a whole-pixel scale the view moves the request by less than a pixel" {
     const req: Zoom = .{ .scale = 2, .anchor_x = 400.3, .anchor_y = 300.6, .pan_x = 10.2 };
     const z = req.resolve(1610, 1034);
     const v = view(req, test_size);

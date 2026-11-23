@@ -1268,10 +1268,14 @@ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 // the pan. The anchor and the pan are in the units of
 // ghostty_surface_mouse_pos. A scale of 1 is no zoom. The scale is clamped to
 // 1 through 3, the anchor to the surface, and the pan so that the picture
-// covers the surface. The font size, the grid and the pty size do not change.
-// Mouse positions, ghostty_surface_ime_point and the tl_px_x and tl_px_y of a
-// ghostty_text_s follow the zoom. The values are kept in pixels: after a
-// change of the content scale, set the zoom again.
+// covers the surface. The picture draws each cell as round(scale x cell)
+// pixels on each axis, so the drawn scale of an axis can be a little
+// different from the request (3.4% at 1.1x for a 16x34 cell). For a picture
+// that does not move when the text sharpens, scale a layer by the same
+// whole-pixel steps. The font size, the grid and the pty size do not
+// change. Mouse positions, ghostty_surface_ime_point and the tl_px_x and
+// tl_px_y of a ghostty_text_s follow the zoom. The values are kept in
+// pixels: after a change of the content scale, set the zoom again.
 GHOSTTY_API void ghostty_surface_set_zoom(ghostty_surface_t,
                                           double scale,
                                           double anchor_x,

@@ -2639,6 +2639,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return try self.renderGlyph(g.index, g.glyph_index, opts);
         }
 
+        /// A distance in base pixels (a shaper offset) in the pixels of
+        /// the grid that renders glyphs: times the zoomed cell over the
+        /// base cell on each axis.
+        fn glyphPixels(self: *const Self, x: i32, y: i32) [2]i32 {
+            const z = self.zoom_glyphs orelse return .{ x, y };
+            const sx = @as(f64, @floatFromInt(z.grid.metrics.cell_width)) /
+                @as(f64, @floatFromInt(self.grid_metrics.cell_width));
+            const sy = @as(f64, @floatFromInt(z.grid.metrics.cell_height)) /
+                @as(f64, @floatFromInt(self.grid_metrics.cell_height));
+            return .{
+                @intFromFloat(@round(@as(f64, @floatFromInt(x)) * sx)),
+                @intFromFloat(@round(@as(f64, @floatFromInt(y)) * sy)),
+            };
+        }
+
         /// Make each frame copy the atlas textures again at its next draw,
         /// after the grid that renders glyphs changed.
         fn resetAtlasStamps(self: *Self) void {
@@ -5170,6 +5185,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
 
+            // The shaper's offsets are in base pixels; a zoomed glyph's
+            // bearings are in the pixels of the grid that rendered it.
+            const shaper_offset = self.glyphPixels(shaper_cell.x_offset, shaper_cell.y_offset);
+
             try self.cells.add(self.alloc, .text, .{
                 .atlas = switch (render.presentation) {
                     .emoji => .color,
@@ -5181,8 +5200,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
-                    @intCast(render.glyph.offset_x + shaper_cell.x_offset),
-                    @intCast(render.glyph.offset_y + shaper_cell.y_offset),
+                    @intCast(render.glyph.offset_x + shaper_offset[0]),
+                    @intCast(render.glyph.offset_y + shaper_offset[1]),
                 },
             });
         }
