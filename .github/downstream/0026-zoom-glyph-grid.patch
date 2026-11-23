@@ -1,6 +1,6 @@
-From 78822593795d5b279b0ddda25873a2c4853c4a62 Mon Sep 17 00:00:00 2001
+From 6f63a5b7de5d073474728d857e53d6eaf33dc242 Mon Sep 17 00:00:00 2001
 From: Ethan Lee <ethantlee21@gmail.com>
-Date: Mon, 23 Nov 2026 12:19:59 -0500
+Date: Mon, 23 Nov 2026 13:26:37 -0500
 Subject: [PATCH] renderer: draw a zoomed picture with sharp glyphs from a
  zoomed glyph grid
 
@@ -27,31 +27,56 @@ The Metal shaders take two new uniforms. zoom moves each cell's corner,
 and the text vertex shader adds the glyph quad in zoomed pixels. Every
 fragment that reads its position goes through screen_grid, the inverse:
 the cell background, the cursor and trail coverage, the region-scroll
-clip and the smooth-scroll clip. The antialiased edge of the cursor,
+clip and the smooth-scroll clip. A shaper offset is in base pixels, so
+it is scaled to the zoomed glyph's pixels. The antialiased edge of the cursor,
 the comet and the trail stays one screen pixel wide. Images zoom at
 their own resolution. If the zoomed grid cannot be built, the base
 glyphs draw scaled with linear sampling (soft, not blocky).
 
-At 1x every new term is an identity (scale 1, offset 0), so a frame is
-the same as before.
+At 1x every new term is an identity (scale 1, offset 0). That is read
+from the source; no frame was compared against the previous build.
 
 The GLSL shaders do not change. An OpenGL renderer draws at 1x, but the
 surface still applies the zoom to the pointer. Macterm draws with Metal
 only.
 ---
- src/Surface.zig                    |  29 +--
- src/font/Collection.zig            | 197 +++++++++++++++++++++
- src/font/SharedGrid.zig            | 102 ++++++++++-
- src/font/SharedGridSet.zig         |  85 +++++++++
+ include/ghostty.h                  |  12 +-
+ src/Surface.zig                    |  38 ++--
+ src/font/Collection.zig            | 197 +++++++++++++++++++
+ src/font/SharedGrid.zig            | 102 +++++++++-
+ src/font/SharedGridSet.zig         |  85 ++++++++
  src/renderer/State.zig             |   3 +-
- src/renderer/Zoom.zig              | 190 ++++++++++++++++++++
- src/renderer/generic.zig           | 275 +++++++++++++++++++++++++----
+ src/renderer/Zoom.zig              | 190 ++++++++++++++++++
+ src/renderer/generic.zig           | 298 +++++++++++++++++++++++++----
  src/renderer/metal/shaders.zig     |  12 ++
- src/renderer/shaders/shaders.metal | 101 ++++++++---
- 9 files changed, 921 insertions(+), 73 deletions(-)
+ src/renderer/shaders/shaders.metal | 101 +++++++---
+ 10 files changed, 955 insertions(+), 83 deletions(-)
 
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 3551fe2d3..10476141d 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1268,10 +1268,14 @@ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+ // the pan. The anchor and the pan are in the units of
+ // ghostty_surface_mouse_pos. A scale of 1 is no zoom. The scale is clamped to
+ // 1 through 3, the anchor to the surface, and the pan so that the picture
+-// covers the surface. The font size, the grid and the pty size do not change.
+-// Mouse positions, ghostty_surface_ime_point and the tl_px_x and tl_px_y of a
+-// ghostty_text_s follow the zoom. The values are kept in pixels: after a
+-// change of the content scale, set the zoom again.
++// covers the surface. The picture draws each cell as round(scale x cell)
++// pixels on each axis, so the drawn scale of an axis can be a little
++// different from the request (3.4% at 1.1x for a 16x34 cell). For a picture
++// that does not move when the text sharpens, scale a layer by the same
++// whole-pixel steps. The font size, the grid and the pty size do not
++// change. Mouse positions, ghostty_surface_ime_point and the tl_px_x and
++// tl_px_y of a ghostty_text_s follow the zoom. The values are kept in
++// pixels: after a change of the content scale, set the zoom again.
+ GHOSTTY_API void ghostty_surface_set_zoom(ghostty_surface_t,
+                                           double scale,
+                                           double anchor_x,
 diff --git a/src/Surface.zig b/src/Surface.zig
-index 73c351256..63a75e52a 100644
+index 73c351256..3474ffda7 100644
 --- a/src/Surface.zig
 +++ b/src/Surface.zig
 @@ -2353,7 +2353,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
@@ -72,16 +97,19 @@ index 73c351256..63a75e52a 100644
      };
  
      return .{
-@@ -5065,30 +5065,33 @@ fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
+@@ -5065,30 +5065,34 @@ fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
      return .{ .x = grid.x, .y = grid.y };
  }
  
 -/// The zoom of the picture (`renderer.Zoom`), resolved for the surface's
 -/// size. A pointer becomes a cell through its inverse: `posToViewport`,
+-/// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
+-/// keeps its y on screen, so a drag past the edge still scrolls. A cell
 +/// The zoom of the picture as the renderer draws it (`renderer.Zoom.view`):
-+/// resolved for the surface's size, with whole-pixel zoomed cells. A pointer becomes a cell through its inverse: `posToViewport`,
- /// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
- /// keeps its y on screen, so a drag past the edge still scrolls. A cell
++/// resolved for the surface's size, with whole-pixel zoomed cells. A
++/// pointer becomes a cell through its inverse: `posToViewport`, `posToPin`,
++/// `mouseReportPos`, and the x of a selection. A selection keeps its y on
++/// screen, so a drag past the edge still scrolls. A cell
  /// becomes a point for the host through its forward: `imePointScaled`
  /// and the text point of `dumpTextLocked`.
  ///
@@ -97,9 +125,11 @@ index 73c351256..63a75e52a 100644
  
  /// Set the zoom of the picture, in surface pixels: `scale` about the
  /// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
- /// A scale of 1 is no zoom. The values are kept as given and clamped at
- /// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
+-/// A scale of 1 is no zoom. The values are kept as given and clamped at
+-/// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
 -/// font size, the grid and the pty size do not change.
++/// A scale of 1 is no zoom. The values are kept as given and resolved at
++/// each use (`renderer.Zoom.view`). This writes only the zoom: the
 +/// font size, the grid and the pty size do not change. The renderer
 +/// draws the next frame with it.
  pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
@@ -556,7 +586,7 @@ index 9913cf2a4..534fcb593 100644
  
  /// Set by the surface as the first step of its teardown, before it joins
 diff --git a/src/renderer/Zoom.zig b/src/renderer/Zoom.zig
-index c8f77d00e..78b772b77 100644
+index c8f77d00e..6cc93c277 100644
 --- a/src/renderer/Zoom.zig
 +++ b/src/renderer/Zoom.zig
 @@ -98,6 +98,96 @@ pub fn inverse(self: Zoom, x: f64, y: f64) size.Coordinate.Surface {
@@ -716,7 +746,7 @@ index c8f77d00e..78b772b77 100644
 +    }
 +}
 +
-+test "pane zoom: view moves the request by less than a pixel" {
++test "pane zoom: at a whole-pixel scale the view moves the request by less than a pixel" {
 +    const req: Zoom = .{ .scale = 2, .anchor_x = 400.3, .anchor_y = 300.6, .pan_x = 10.2 };
 +    const z = req.resolve(1610, 1034);
 +    const v = view(req, test_size);
@@ -761,7 +791,7 @@ index c8f77d00e..78b772b77 100644
 +    }
 +}
 diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
-index 6b9a8cac5..97feb4e36 100644
+index 6b9a8cac5..e00890dea 100644
 --- a/src/renderer/generic.zig
 +++ b/src/renderer/generic.zig
 @@ -907,6 +907,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
@@ -800,7 +830,7 @@ index 6b9a8cac5..97feb4e36 100644
  
              self.config.deinit();
              self.api.deinit();
-@@ -2553,6 +2575,170 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -2553,6 +2575,185 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              display_link.setRunning(should_run);
          }
  
@@ -866,6 +896,21 @@ index 6b9a8cac5..97feb4e36 100644
 +            const g = try self.font_grid.codepointGlyph(self.alloc, cp, style, p) orelse
 +                return null;
 +            return try self.renderGlyph(g.index, g.glyph_index, opts);
++        }
++
++        /// A distance in base pixels (a shaper offset) in the pixels of
++        /// the grid that renders glyphs: times the zoomed cell over the
++        /// base cell on each axis.
++        fn glyphPixels(self: *const Self, x: i32, y: i32) [2]i32 {
++            const z = self.zoom_glyphs orelse return .{ x, y };
++            const sx = @as(f64, @floatFromInt(z.grid.metrics.cell_width)) /
++                @as(f64, @floatFromInt(self.grid_metrics.cell_width));
++            const sy = @as(f64, @floatFromInt(z.grid.metrics.cell_height)) /
++                @as(f64, @floatFromInt(self.grid_metrics.cell_height));
++            return .{
++                @intFromFloat(@round(@as(f64, @floatFromInt(x)) * sx)),
++                @intFromFloat(@round(@as(f64, @floatFromInt(y)) * sy)),
++            };
 +        }
 +
 +        /// Make each frame copy the atlas textures again at its next draw,
@@ -971,7 +1016,7 @@ index 6b9a8cac5..97feb4e36 100644
          /// Set the new font grid.
          ///
          /// Must be called on the render thread.
-@@ -2560,7 +2746,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -2560,7 +2761,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              self.draw_mutex.lockUncancelable(global.io());
              defer self.draw_mutex.unlock(global.io());
  
@@ -983,7 +1028,7 @@ index 6b9a8cac5..97feb4e36 100644
              self.font_grid = grid;
  
              // Update all our textures so that they sync on the next frame.
-@@ -2611,6 +2800,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -2611,6 +2815,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  @floatFromInt(self.grid_metrics.cell_width),
                  @floatFromInt(self.grid_metrics.cell_height),
              };
@@ -991,7 +1036,7 @@ index 6b9a8cac5..97feb4e36 100644
          }
  
          /// Update the frame data.
-@@ -2649,6 +2839,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -2649,6 +2854,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  preedit: ?renderer.State.Preedit,
                  scrollbar: terminal.Scrollbar,
                  overlay_features: []const Overlay.Feature,
@@ -999,7 +1044,7 @@ index 6b9a8cac5..97feb4e36 100644
              };
  
              // Update all our data as tightly as possible within the mutex.
-@@ -2839,6 +3030,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -2839,6 +3045,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                      .preedit = preedit,
                      .scrollbar = scrollbar,
                      .overlay_features = overlay_features,
@@ -1007,7 +1052,7 @@ index 6b9a8cac5..97feb4e36 100644
                  };
              };
  
-@@ -2928,6 +3120,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -2928,6 +3135,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  self.draw_mutex.lockUncancelable(global.io());
                  defer self.draw_mutex.unlock(global.io());
  
@@ -1018,7 +1063,7 @@ index 6b9a8cac5..97feb4e36 100644
                  // Build our GPU cells
                  self.rebuildCells(
                      critical.preedit,
-@@ -3209,22 +3405,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -3209,22 +3420,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  frame.bg_image_buffer_modified = self.bg_image_buffer_modified;
              }
  
@@ -1054,7 +1099,7 @@ index 6b9a8cac5..97feb4e36 100644
              }
  
              // Get a frame context from the graphics API.
-@@ -4845,8 +5043,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -4845,8 +5058,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                  .curly => .underline_curly,
              };
  
@@ -1064,7 +1109,7 @@ index 6b9a8cac5..97feb4e36 100644
                  font.sprite_index,
                  @backingInt(sprite),
                  .{
-@@ -4876,8 +5073,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -4876,8 +5088,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              color: terminal.color.RGB,
              alpha: u8,
          ) !void {
@@ -1074,7 +1119,7 @@ index 6b9a8cac5..97feb4e36 100644
                  font.sprite_index,
                  @backingInt(font.Sprite.overline),
                  .{
-@@ -4907,8 +5103,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -4907,8 +5118,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              color: terminal.color.RGB,
              alpha: u8,
          ) !void {
@@ -1084,7 +1129,7 @@ index 6b9a8cac5..97feb4e36 100644
                  font.sprite_index,
                  @backingInt(font.Sprite.strikethrough),
                  .{
-@@ -4946,8 +5141,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -4946,8 +5156,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              const cp = cell.codepoint();
  
              // Render
@@ -1094,7 +1139,29 @@ index 6b9a8cac5..97feb4e36 100644
                  shaper_run.font_index,
                  shaper_cell.glyph_index,
                  .{
-@@ -5049,8 +5243,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -4976,6 +5185,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 return;
+             }
+ 
++            // The shaper's offsets are in base pixels; a zoomed glyph's
++            // bearings are in the pixels of the grid that rendered it.
++            const shaper_offset = self.glyphPixels(shaper_cell.x_offset, shaper_cell.y_offset);
++
+             try self.cells.add(self.alloc, .text, .{
+                 .atlas = switch (render.presentation) {
+                     .emoji => .color,
+@@ -4987,8 +5200,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                 .glyph_size = .{ render.glyph.width, render.glyph.height },
+                 .bearings = .{
+-                    @intCast(render.glyph.offset_x + shaper_cell.x_offset),
+-                    @intCast(render.glyph.offset_y + shaper_cell.y_offset),
++                    @intCast(render.glyph.offset_x + shaper_offset[0]),
++                    @intCast(render.glyph.offset_y + shaper_offset[1]),
+                 },
+             });
+         }
+@@ -5049,8 +5262,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                          .lock => unreachable,
                      };
  
@@ -1104,7 +1171,7 @@ index 6b9a8cac5..97feb4e36 100644
                          font.sprite_index,
                          @backingInt(sprite),
                          .{
-@@ -5063,8 +5256,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -5063,8 +5275,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                      };
                  },
  
@@ -1114,7 +1181,7 @@ index 6b9a8cac5..97feb4e36 100644
                      0xF023, // lock symbol
                      .regular,
                      .text,
-@@ -5086,16 +5278,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -5086,16 +5297,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              if (tracked) {
                  const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
                  const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
@@ -1159,7 +1226,7 @@ index 6b9a8cac5..97feb4e36 100644
                  };
                  const cell: [2]u16 = .{ @intCast(x), @intCast(cursor_vp.y) };
                  if (self.cursor_glide) |*glide| {
-@@ -5134,8 +5350,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+@@ -5134,8 +5369,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
              screen_fg: terminal.color.RGB,
          ) !void {
              // Render the glyph for our preedit text
