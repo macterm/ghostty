@@ -70,6 +70,7 @@ env:
     .github/downstream/0027-zoom-hover-refresh.patch
     .github/downstream/0028-config-get-theme.patch
     .github/downstream/0029-text-point-shift.patch
+    .github/downstream/0030-atlas-texture-shrink.patch
 
 jobs:
   sync:
