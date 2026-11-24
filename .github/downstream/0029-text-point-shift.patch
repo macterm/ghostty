@@ -1,0 +1,40 @@
+From 0ccdbccb471114a29adca5d4e094bfeae5f613c0 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Mon, 23 Nov 2026 21:28:24 -0500
+Subject: [PATCH] core: draw the text point of dumpTextLocked where the row is
+ drawn
+
+Quick Look and Explain Output anchor a popover to the text point of
+dumpTextLocked (tl_px_x, tl_px_y). The point came from the cell and
+the padding only. With smooth-scroll the renderer draws the grid
+shifted, and a region scroll animation shifts its region more. Thus
+the popover could be up to one row off the drawn text.
+
+The point now adds the same shift as imePointScaled:
+viewportPixelShift and the region shift at the top-left cell. The
+caller holds the render_state mutex, which both need.
+---
+ src/Surface.zig | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 3474ffda7..34f5d53a7 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -2207,6 +2207,13 @@ pub fn dumpTextLocked(
+             // Add padding
+             y += @floatFromInt(self.size.padding.top);
+ 
++            // Of the row as it is drawn (see `imePointScaled`). A
++            // viewport row is less than the row count, so the cast holds.
++            y += self.viewportPixelShift() + self.regionShifts().offsetAt(
++                tl_coord.x,
++                @intCast(tl_coord.y),
++            );
++
+             // Zoom
+             y = z.forward(0, y).y;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

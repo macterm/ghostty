@@ -238,3 +238,39 @@ test "c_get: split-preserve-zoom" {
     try testing.expect(get(&c, .@"split-preserve-zoom", @ptrCast(&bits)));
     try testing.expectEqual(@as(c_uint, 1), bits);
 }
+
+test "c_get: theme" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c = try Config.default(alloc);
+    defer c.deinit();
+
+    {
+        c.theme = null;
+        var cval: Config.Theme.C = undefined;
+        try testing.expect(!get(&c, .theme, @ptrCast(&cval)));
+    }
+
+    {
+        const arena = c._arena.?.allocator();
+        var theme: Config.Theme = undefined;
+        try theme.parseCLI(arena, "light:Rose Pine Dawn,dark:Rose Pine");
+        c.theme = theme;
+        var cval: Config.Theme.C = undefined;
+        try testing.expect(get(&c, .theme, @ptrCast(&cval)));
+        try testing.expectEqualStrings("Rose Pine Dawn", cval.light[0..cval.light_len]);
+        try testing.expectEqualStrings("Rose Pine", cval.dark[0..cval.dark_len]);
+    }
+
+    {
+        const arena = c._arena.?.allocator();
+        var theme: Config.Theme = undefined;
+        try theme.parseCLI(arena, "Builtin Tango Dark");
+        c.theme = theme;
+        var cval: Config.Theme.C = undefined;
+        try testing.expect(get(&c, .theme, @ptrCast(&cval)));
+        try testing.expectEqualStrings("Builtin Tango Dark", cval.light[0..cval.light_len]);
+        try testing.expectEqualStrings("Builtin Tango Dark", cval.dark[0..cval.dark_len]);
+    }
+}

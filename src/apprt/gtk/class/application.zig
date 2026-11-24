@@ -780,6 +780,12 @@ pub const Application = extern struct {
             // GTK has no accessibility consumer for this yet.
             .selection_changed => {},
 
+            // Reserved for embedders that consume activity heartbeats.
+            .output_activity => {},
+
+            // Reserved for embedders with a private APC contract.
+            .unknown_apc => {},
+
             .scrollbar => Action.scrollbar(target, value),
 
             .set_title => Action.setTitle(target, value),
