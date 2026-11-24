@@ -5084,15 +5084,43 @@ fn zoom(self: *const Surface) rendererpkg.Zoom.View {
 /// each use (`renderer.Zoom.view`). This writes only the zoom: the
 /// font size, the grid and the pty size do not change. The renderer
 /// draws the next frame with it.
+///
+/// A zoom moves the cell under a pointer that does not move, and the
+/// embedded apprt sends no pointer event for a still pointer. So the link
+/// hover is found again here from the last pointer position.
 pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         self.renderer_state.zoom = request;
+        self.refreshLinksAfterZoom() catch |err| {
+            log.warn("failed to refresh links after a zoom err={}", .{err});
+        };
     }
     self.queueRender() catch |err| {
         log.warn("error queueing a render after a zoom err={}", .{err});
     };
+}
+
+/// Find the link hover again at the last pointer position, with the
+/// zoom that was just set. The same gate as `cursorPosCallback`: when
+/// the program gets mouse reports, the pointer is not for links.
+///
+/// Precondition: the render_state mutex must be held.
+fn refreshLinksAfterZoom(self: *Surface) !void {
+    if (self.io.terminal.flags.mouse_event != .none and
+        !(self.mouse.mods.shift and !self.mouseShiftCapture(false))) return;
+
+    const pos = try self.rt_surface.getCursorPos();
+    if (pos.x < 0 or pos.y < 0) return;
+
+    // As `cursorPosCallback` does: clear the old hover first, so that
+    // a cell with no link under the pointer shows no highlight.
+    const over_link = self.mouse.over_link;
+    self.mouse.over_link = false;
+    self.renderer_state.mouse.point = null;
+    self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    try self.mouseRefreshLinks(pos, self.posToViewport(pos.x, pos.y), over_link);
 }
 
 /// How far below its row-aligned position the renderer draws the
