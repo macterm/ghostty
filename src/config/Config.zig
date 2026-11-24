@@ -10261,6 +10261,26 @@ pub const Theme = struct {
     light: []const u8,
     dark: []const u8,
 
+    /// The C type of the value, for `ghostty_config_get` (Macterm). A side
+    /// of a light/dark pair has no sentinel (`cli.args.parseAutoStruct`
+    /// copies a `[]const u8` with no 0), so each side is a pointer and a
+    /// length. A plain theme gives the same name for both sides.
+    pub const C = extern struct {
+        light: [*]const u8,
+        light_len: usize,
+        dark: [*]const u8,
+        dark_len: usize,
+    };
+
+    pub fn cval(self: Theme) Theme.C {
+        return .{
+            .light = self.light.ptr,
+            .light_len = self.light.len,
+            .dark = self.dark.ptr,
+            .dark_len = self.dark.len,
+        };
+    }
+
     pub fn parseCLI(self: *Theme, alloc: Allocator, input_: ?[]const u8) !void {
         const input = input_ orelse return error.ValueRequired;
         if (input.len == 0) return error.ValueRequired;

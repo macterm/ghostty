@@ -591,6 +591,15 @@ typedef struct {
   uint8_t b;
 } ghostty_config_color_s;
 
+// config.Theme. Each side is a pointer and a length, with no terminating
+// NUL. A plain theme gives the same name for both sides.
+typedef struct {
+  const char* GHOSTTY_NULL_UNSPECIFIED light;
+  size_t light_len;
+  const char* GHOSTTY_NULL_UNSPECIFIED dark;
+  size_t dark_len;
+} ghostty_config_theme_s;
+
 // config.ColorList
 typedef struct {
   const ghostty_config_color_s* GHOSTTY_NULL_UNSPECIFIED colors;
