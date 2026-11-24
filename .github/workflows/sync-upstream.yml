@@ -69,6 +69,7 @@ env:
     .github/downstream/0026-zoom-glyph-grid.patch
     .github/downstream/0027-zoom-hover-refresh.patch
     .github/downstream/0028-config-get-theme.patch
+    .github/downstream/0029-text-point-shift.patch
 
 jobs:
   sync:

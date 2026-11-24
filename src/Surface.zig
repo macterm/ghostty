@@ -2207,6 +2207,13 @@ pub fn dumpTextLocked(
             // Add padding
             y += @floatFromInt(self.size.padding.top);
 
+            // Of the row as it is drawn (see `imePointScaled`). A
+            // viewport row is less than the row count, so the cast holds.
+            y += self.viewportPixelShift() + self.regionShifts().offsetAt(
+                tl_coord.x,
+                @intCast(tl_coord.y),
+            );
+
             // Zoom
             y = z.forward(0, y).y;
 
