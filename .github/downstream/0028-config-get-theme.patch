@@ -1,0 +1,115 @@
+From 3b799fa6284dacedc01fa93839dc2d14b735d4f8 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Mon, 23 Nov 2026 22:21:46 -0500
+Subject: [PATCH] config: give the theme value through ghostty_config_get
+
+The C API gave no theme value. An embedder that shows the other side of
+a light/dark pair had to read the config files and their includes
+itself, and a read that differed from the merge gave wrong colors with
+no failure. Theme now has a cval: ghostty_config_get(cfg, "theme")
+gives both sides of the merged value, each as a pointer and a length,
+because a side of a pair has no NUL terminator.
+---
+ include/ghostty.h     |  9 +++++++++
+ src/config/Config.zig | 20 ++++++++++++++++++++
+ src/config/c_get.zig  | 36 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 10476141d..34a0dd872 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -591,6 +591,15 @@ typedef struct {
+   uint8_t b;
+ } ghostty_config_color_s;
+ 
++// config.Theme. Each side is a pointer and a length, with no terminating
++// NUL. A plain theme gives the same name for both sides.
++typedef struct {
++  const char* GHOSTTY_NULL_UNSPECIFIED light;
++  size_t light_len;
++  const char* GHOSTTY_NULL_UNSPECIFIED dark;
++  size_t dark_len;
++} ghostty_config_theme_s;
++
+ // config.ColorList
+ typedef struct {
+   const ghostty_config_color_s* GHOSTTY_NULL_UNSPECIFIED colors;
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 873da69fe..318421c08 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -10261,6 +10261,26 @@ pub const Theme = struct {
+     light: []const u8,
+     dark: []const u8,
+ 
++    /// The C type of the value, for `ghostty_config_get` (Macterm). A side
++    /// of a light/dark pair has no sentinel (`cli.args.parseAutoStruct`
++    /// copies a `[]const u8` with no 0), so each side is a pointer and a
++    /// length. A plain theme gives the same name for both sides.
++    pub const C = extern struct {
++        light: [*]const u8,
++        light_len: usize,
++        dark: [*]const u8,
++        dark_len: usize,
++    };
++
++    pub fn cval(self: Theme) Theme.C {
++        return .{
++            .light = self.light.ptr,
++            .light_len = self.light.len,
++            .dark = self.dark.ptr,
++            .dark_len = self.dark.len,
++        };
++    }
++
+     pub fn parseCLI(self: *Theme, alloc: Allocator, input_: ?[]const u8) !void {
+         const input = input_ orelse return error.ValueRequired;
+         if (input.len == 0) return error.ValueRequired;
+diff --git a/src/config/c_get.zig b/src/config/c_get.zig
+index c36f5315d..a9f1f871d 100644
+--- a/src/config/c_get.zig
++++ b/src/config/c_get.zig
+@@ -238,3 +238,39 @@ test "c_get: split-preserve-zoom" {
+     try testing.expect(get(&c, .@"split-preserve-zoom", @ptrCast(&bits)));
+     try testing.expectEqual(@as(c_uint, 1), bits);
+ }
++
++test "c_get: theme" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var c = try Config.default(alloc);
++    defer c.deinit();
++
++    {
++        c.theme = null;
++        var cval: Config.Theme.C = undefined;
++        try testing.expect(!get(&c, .theme, @ptrCast(&cval)));
++    }
++
++    {
++        const arena = c._arena.?.allocator();
++        var theme: Config.Theme = undefined;
++        try theme.parseCLI(arena, "light:Rose Pine Dawn,dark:Rose Pine");
++        c.theme = theme;
++        var cval: Config.Theme.C = undefined;
++        try testing.expect(get(&c, .theme, @ptrCast(&cval)));
++        try testing.expectEqualStrings("Rose Pine Dawn", cval.light[0..cval.light_len]);
++        try testing.expectEqualStrings("Rose Pine", cval.dark[0..cval.dark_len]);
++    }
++
++    {
++        const arena = c._arena.?.allocator();
++        var theme: Config.Theme = undefined;
++        try theme.parseCLI(arena, "Builtin Tango Dark");
++        c.theme = theme;
++        var cval: Config.Theme.C = undefined;
++        try testing.expect(get(&c, .theme, @ptrCast(&cval)));
++        try testing.expectEqualStrings("Builtin Tango Dark", cval.light[0..cval.light_len]);
++        try testing.expectEqualStrings("Builtin Tango Dark", cval.dark[0..cval.dark_len]);
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
