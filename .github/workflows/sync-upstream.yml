@@ -67,6 +67,7 @@ env:
     .github/downstream/0024-idle-targets-volatile.patch
     .github/downstream/0025-pane-zoom.patch
     .github/downstream/0026-zoom-glyph-grid.patch
+    .github/downstream/0028-text-point-shift.patch
 
 jobs:
   sync:
