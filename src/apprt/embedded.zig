@@ -1094,6 +1094,19 @@ pub const Surface = struct {
         const x_scaled = @max(1, if (std.math.isNan(x)) 1 else x);
         const y_scaled = @max(1, if (std.math.isNan(y)) 1 else y);
 
+        // The last pointer position is in pixels. Scale it with the
+        // content, so that a still pointer keeps its point in the view: a
+        // zoom that the host sets again after this change finds the link
+        // hover there. A negative position is outside the view and stays.
+        if (self.cursor_pos.x >= 0 and self.cursor_pos.y >= 0 and
+            self.content_scale.x > 0 and self.content_scale.y > 0)
+        {
+            self.cursor_pos = .{
+                .x = self.cursor_pos.x * @as(f32, @floatCast(x_scaled)) / self.content_scale.x,
+                .y = self.cursor_pos.y * @as(f32, @floatCast(y_scaled)) / self.content_scale.y,
+            };
+        }
+
         self.content_scale = .{
             .x = @floatCast(x_scaled),
             .y = @floatCast(y_scaled),
