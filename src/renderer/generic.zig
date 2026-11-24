@@ -924,6 +924,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// is not tried again at each frame.
         zoom_glyphs_failed: f64 = 1,
 
+        /// The number of frames that must still copy the atlas textures,
+        /// after the grid that renders glyphs changed (`resetAtlasStamps`).
+        /// The next draws copy them even when the atlas did not change, so
+        /// that each frame texture takes the size of the new atlas. While
+        /// this is not zero, `animationWake` asks for draws, so that an
+        /// idle frame does not keep a zoomed texture.
+        atlas_resync_frames: u8 = 0,
+
         /// The images that we may render.
         images: ImageState = .empty,
 
@@ -1975,7 +1983,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // is on its way; both are recomputed from the clock in
             // drawFrame, so a draw wake is all they need.
             const draw_delay: ?u64 = if (self.region_anims.items.len > 0 or
-                self.cursorGlideInFlight())
+                self.cursorGlideInFlight() or
+                self.atlas_resync_frames > 0)
                 draw_interval_ms
             else
                 shader_delay;
@@ -2512,6 +2521,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 sc.deinit();
                 self.swap_chain = null;
             }
+            // A new swap chain makes its textures from the atlas.
+            self.atlas_resync_frames = 0;
 
             // Release the shaders as well if we're unrealized.
             if (!self.display_realized) {
@@ -2661,6 +2672,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.grayscale_modified = 0;
                 frame.color_modified = 0;
             };
+            if (self.swap_chain != null) self.atlas_resync_frames = SwapChain.buf_count;
         }
 
         /// Free the zoomed glyph grid. Caller must hold the draw mutex.
@@ -2771,10 +2783,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // We can modify this without a lock because the GPU does not
             // touch this data. A released swap chain is rebuilt with
             // fresh frames that sync all textures on first use.
-            if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
-                frame.grayscale_modified = 0;
-                frame.color_modified = 0;
-            };
+            self.resetAtlasStamps();
 
             // Get our metrics from the grid. This doesn't require a lock because
             // the metrics are never recalculated.
@@ -3422,10 +3431,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If our font atlas changed, sync the texture data. The atlas
             // is the zoomed glyph grid's while the picture is zoomed.
+            // After a change of that grid, copy it even if it did not
+            // change: an atlas that was never modified has a stamp of 0.
             const glyph_grid = self.glyphGrid();
+            const resync = self.atlas_resync_frames > 0;
+            if (resync) self.atlas_resync_frames -= 1;
             texture: {
                 const modified = glyph_grid.atlas_grayscale.modified.load(.monotonic);
-                if (modified <= frame.grayscale_modified) break :texture;
+                if (!resync and modified <= frame.grayscale_modified) break :texture;
                 glyph_grid.lock.lockSharedUncancelable(global.io());
                 defer glyph_grid.lock.unlockShared(global.io());
                 frame.grayscale_modified = glyph_grid.atlas_grayscale.modified.load(.monotonic);
@@ -3433,7 +3446,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             texture: {
                 const modified = glyph_grid.atlas_color.modified.load(.monotonic);
-                if (modified <= frame.color_modified) break :texture;
+                if (!resync and modified <= frame.color_modified) break :texture;
                 glyph_grid.lock.lockSharedUncancelable(global.io());
                 defer glyph_grid.lock.unlockShared(global.io());
                 frame.color_modified = glyph_grid.atlas_color.modified.load(.monotonic);
@@ -5408,19 +5421,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Sync the atlas data to the given texture. This copies the bytes
-        /// associated with the atlas to the given texture. If the atlas no
-        /// longer fits into the texture, the texture will be resized.
+        /// associated with the atlas to the given texture. If the atlas
+        /// size is not the texture size, this makes the texture again at
+        /// the atlas size. An atlas only grows, but the grid that renders
+        /// glyphs changes at a zoom and an unzoom, and its new atlas can be
+        /// smaller.
         fn syncAtlasTexture(
             self: *const Self,
             atlas: *const font.Atlas,
             texture: *Texture,
         ) !void {
-            if (atlas.size > texture.width) {
-                // Free our old texture
+            if (atlas.size != texture.width) {
+                // Make the new texture first, so that a failure keeps a
+                // valid texture.
+                const new = try self.api.initAtlasTexture(atlas);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = new;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
