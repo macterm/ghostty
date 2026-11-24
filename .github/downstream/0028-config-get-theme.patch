@@ -5,10 +5,12 @@ Subject: [PATCH] config: give the theme value through ghostty_config_get
 
 The C API gave no theme value. An embedder that shows the other side of
 a light/dark pair had to read the config files and their includes
-itself, and a read that differed from the merge gave wrong colors with
-no failure. Theme now has a cval: ghostty_config_get(cfg, "theme")
-gives both sides of the merged value, each as a pointer and a length,
-because a side of a pair has no NUL terminator.
+itself. When that read differed from the merge, the colors were wrong
+and nothing failed.
+
+Theme now has a cval: ghostty_config_get(cfg, "theme") gives both sides
+of the merged value. Each side is a pointer and a length, because a
+side of a pair has no NUL terminator.
 ---
  include/ghostty.h     |  9 +++++++++
  src/config/Config.zig | 20 ++++++++++++++++++++
