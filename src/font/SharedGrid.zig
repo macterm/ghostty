@@ -275,19 +275,107 @@ pub fn renderCodepoint(
     // text which is relatively rare and almost non-existent in multiple
     // surfaces at the same time.
 
+    const g = try self.codepointGlyph(alloc, cp, style, p) orelse return null;
+    return try self.renderGlyph(alloc, g.index, g.glyph_index, opts);
+}
+
+pub const CodepointGlyph = struct {
+    index: Collection.Index,
+    glyph_index: u32,
+};
+
+/// The font index and glyph index that `renderCodepoint` renders for a
+/// codepoint, or null if no font has it. A zoomed glyph grid renders
+/// them with `renderGlyph` (see `initZoomed`).
+pub fn codepointGlyph(
+    self: *SharedGrid,
+    alloc: Allocator,
+    cp: u32,
+    style: Style,
+    p: ?Presentation,
+) !?CodepointGlyph {
     // Get the font that has the codepoint
     const index = try self.getIndex(alloc, cp, style, p) orelse return null;
 
     // Get the glyph for the font
-    const glyph_index = glyph_index: {
-        self.lock.lockSharedUncancelable(global.io());
-        defer self.lock.unlockShared(global.io());
-        const face = try self.resolver.collection.getFace(index);
-        break :glyph_index face.glyphIndex(cp) orelse return null;
-    };
+    self.lock.lockSharedUncancelable(global.io());
+    defer self.lock.unlockShared(global.io());
+    const face = try self.resolver.collection.getFace(index);
+    const glyph_index = face.glyphIndex(cp) orelse return null;
+    return .{ .index = index, .glyph_index = glyph_index };
+}
 
-    // Render
-    return try self.renderGlyph(alloc, index, glyph_index, opts);
+/// A grid that draws the glyphs of `base` for a zoomed picture: its
+/// faces are those of `base` in the same order (`Collection.initMirror`)
+/// at the font size times `scale`, and its cells are `cell_width` x
+/// `cell_height` pixels. The base grid keeps the layout and the shaping;
+/// this grid only renders the glyphs that the base grid found, by font
+/// index and glyph index. It never finds a face itself: a codepoint goes
+/// through `base.codepointGlyph`, and an index that it does not have yet
+/// through `mirror`.
+///
+/// The base's metric modifiers apply too, with an absolute value times
+/// `scale`. The cell size replaces any cell modifier. `modifiers` holds
+/// them and must live as long as the grid. The caller owns both.
+pub fn initZoomed(
+    alloc: Allocator,
+    base: *SharedGrid,
+    scale: f64,
+    cell_width: u32,
+    cell_height: u32,
+    modifiers: *Metrics.ModifierSet,
+) !SharedGrid {
+    var resolver: CodepointResolver = resolver: {
+        base.lock.lockSharedUncancelable(global.io());
+        defer base.lock.unlockShared(global.io());
+
+        const base_collection = &base.resolver.collection;
+        var size = (base_collection.load_options orelse
+            return error.DeferredLoadingUnavailable).size;
+        size.points *= @floatCast(scale);
+
+        modifiers.clearRetainingCapacity();
+        var it = base_collection.metric_modifiers.iterator();
+        while (it.next()) |entry| switch (entry.key_ptr.*) {
+            .cell_width, .cell_height => {},
+            else => try modifiers.put(alloc, entry.key_ptr.*, switch (entry.value_ptr.*) {
+                .percent => entry.value_ptr.*,
+                .absolute => |v| .{ .absolute = @intFromFloat(
+                    @round(@as(f64, @floatFromInt(v)) * scale),
+                ) },
+            }),
+        };
+
+        break :resolver .{
+            .collection = try Collection.initMirror(alloc, base_collection, size),
+            .styles = base.resolver.styles,
+        };
+    };
+    errdefer resolver.deinit(alloc);
+
+    // The cell the font gives at this size is not the base cell times the
+    // scale (2x of 16x34 can be 31x69), so set it with the modifiers.
+    const collection = &resolver.collection;
+    collection.metric_modifiers = modifiers.*;
+    try collection.updateMetrics();
+    const natural = collection.metrics.?;
+    try modifiers.put(alloc, .cell_width, .{ .absolute = @as(i32, @intCast(cell_width)) -
+        @as(i32, @intCast(natural.cell_width)) });
+    try modifiers.put(alloc, .cell_height, .{ .absolute = @as(i32, @intCast(cell_height)) -
+        @as(i32, @intCast(natural.cell_height)) });
+    collection.metric_modifiers = modifiers.*;
+
+    return try init(alloc, resolver);
+}
+
+/// Add the faces of `base` that this zoomed grid (`initZoomed`) does not
+/// have yet. Call it when a font index of the base is out of bounds here.
+pub fn mirror(self: *SharedGrid, alloc: Allocator, base: *SharedGrid) !void {
+    self.lock.lockUncancelable(global.io());
+    defer self.lock.unlock(global.io());
+    base.lock.lockSharedUncancelable(global.io());
+    defer base.lock.unlockShared(global.io());
+    try self.resolver.collection.mirror(alloc, &base.resolver.collection);
 }
 
 pub const renderGlyph_tw = tripwire.module(enum {
