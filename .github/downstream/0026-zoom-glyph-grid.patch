@@ -1,0 +1,1473 @@
+From 6f63a5b7de5d073474728d857e53d6eaf33dc242 Mon Sep 17 00:00:00 2001
+From: Ethan Lee <ethantlee21@gmail.com>
+Date: Mon, 23 Nov 2026 13:26:37 -0500
+Subject: [PATCH] renderer: draw a zoomed picture with sharp glyphs from a
+ zoomed glyph grid
+
+A pinch in Macterm zooms the picture of a pane (patch 0025). This patch
+draws that zoom. The font size, the grid and the pty size do not change.
+
+Zoom.View is the zoom as the picture draws it. A zoomed cell is a whole
+number of pixels, round(scale x cell) on each axis, so that box drawing
+and block glyphs tile with no gap. The grid's first cell draws on a
+whole pixel. The surface hit tests with the same View, so the pointer
+and the picture always agree.
+
+The renderer keeps the layout and the shaping on its font grid. For a
+zoom it adds a second grid, at the font size times the scale, with the
+zoomed cell size as a metric override. That grid renders the glyphs,
+the underline, strikethrough and overline sprites, and the cursor
+sprite. Its faces are those of the base grid in the same order
+(Collection.initMirror), so a font index from the shaper names the same
+face in both. A face that the base finds later is copied when its index
+is first rendered. A codepoint (the lock cursor, preedit) is found on
+the base grid. A zoom back to 1x frees the grid.
+
+The Metal shaders take two new uniforms. zoom moves each cell's corner,
+and the text vertex shader adds the glyph quad in zoomed pixels. Every
+fragment that reads its position goes through screen_grid, the inverse:
+the cell background, the cursor and trail coverage, the region-scroll
+clip and the smooth-scroll clip. A shaper offset is in base pixels, so
+it is scaled to the zoomed glyph's pixels. The antialiased edge of the cursor,
+the comet and the trail stays one screen pixel wide. Images zoom at
+their own resolution. If the zoomed grid cannot be built, the base
+glyphs draw scaled with linear sampling (soft, not blocky).
+
+At 1x every new term is an identity (scale 1, offset 0). That is read
+from the source; no frame was compared against the previous build.
+
+The GLSL shaders do not change. An OpenGL renderer draws at 1x, but the
+surface still applies the zoom to the pointer. Macterm draws with Metal
+only.
+---
+ include/ghostty.h                  |  12 +-
+ src/Surface.zig                    |  38 ++--
+ src/font/Collection.zig            | 197 +++++++++++++++++++
+ src/font/SharedGrid.zig            | 102 +++++++++-
+ src/font/SharedGridSet.zig         |  85 ++++++++
+ src/renderer/State.zig             |   3 +-
+ src/renderer/Zoom.zig              | 190 ++++++++++++++++++
+ src/renderer/generic.zig           | 298 +++++++++++++++++++++++++----
+ src/renderer/metal/shaders.zig     |  12 ++
+ src/renderer/shaders/shaders.metal | 101 +++++++---
+ 10 files changed, 955 insertions(+), 83 deletions(-)
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 3551fe2d3..10476141d 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1268,10 +1268,14 @@ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+ // the pan. The anchor and the pan are in the units of
+ // ghostty_surface_mouse_pos. A scale of 1 is no zoom. The scale is clamped to
+ // 1 through 3, the anchor to the surface, and the pan so that the picture
+-// covers the surface. The font size, the grid and the pty size do not change.
+-// Mouse positions, ghostty_surface_ime_point and the tl_px_x and tl_px_y of a
+-// ghostty_text_s follow the zoom. The values are kept in pixels: after a
+-// change of the content scale, set the zoom again.
++// covers the surface. The picture draws each cell as round(scale x cell)
++// pixels on each axis, so the drawn scale of an axis can be a little
++// different from the request (3.4% at 1.1x for a 16x34 cell). For a picture
++// that does not move when the text sharpens, scale a layer by the same
++// whole-pixel steps. The font size, the grid and the pty size do not
++// change. Mouse positions, ghostty_surface_ime_point and the tl_px_x and
++// tl_px_y of a ghostty_text_s follow the zoom. The values are kept in
++// pixels: after a change of the content scale, set the zoom again.
+ GHOSTTY_API void ghostty_surface_set_zoom(ghostty_surface_t,
+                                           double scale,
+                                           double anchor_x,
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 73c351256..3474ffda7 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -2353,7 +2353,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+     // rendering only renders in a single line.
+     const height: f64 = height: {
+         var height: f64 = @floatFromInt(self.size.cell.height);
+-        height *= z.scale;
++        height *= z.scale_y;
+         height /= scale.y;
+         break :height height;
+     };
+@@ -2373,7 +2373,7 @@ pub fn imePointScaled(self: *Surface, scale: apprt.ContentScale) apprt.IMEPos {
+         // that is so I'm going to just leave this comment here so its known
+         // that I left this out on purpose pending more investigation.
+ 
+-        break :width width * z.scale;
++        break :width width * z.scale_x;
+     };
+ 
+     return .{
+@@ -5065,30 +5065,34 @@ fn basePosToViewport(self: *Surface, xpos: f64, ypos: f64) terminal.point.Coordi
+     return .{ .x = grid.x, .y = grid.y };
+ }
+ 
+-/// The zoom of the picture (`renderer.Zoom`), resolved for the surface's
+-/// size. A pointer becomes a cell through its inverse: `posToViewport`,
+-/// `posToPin`, `mouseReportPos`, and the x of a selection. A selection
+-/// keeps its y on screen, so a drag past the edge still scrolls. A cell
++/// The zoom of the picture as the renderer draws it (`renderer.Zoom.view`):
++/// resolved for the surface's size, with whole-pixel zoomed cells. A
++/// pointer becomes a cell through its inverse: `posToViewport`, `posToPin`,
++/// `mouseReportPos`, and the x of a selection. A selection keeps its y on
++/// screen, so a drag past the edge still scrolls. A cell
+ /// becomes a point for the host through its forward: `imePointScaled`
+ /// and the text point of `dumpTextLocked`.
+ ///
+ /// Precondition: the render_state mutex must be held.
+-fn zoom(self: *const Surface) rendererpkg.Zoom {
+-    return self.renderer_state.zoom.resolve(
+-        @floatFromInt(self.size.screen.width),
+-        @floatFromInt(self.size.screen.height),
+-    );
++fn zoom(self: *const Surface) rendererpkg.Zoom.View {
++    return self.renderer_state.zoom.view(self.size);
+ }
+ 
+ /// Set the zoom of the picture, in surface pixels: `scale` about the
+ /// anchor (`anchor_x`, `anchor_y`), then a move by (`pan_x`, `pan_y`).
+-/// A scale of 1 is no zoom. The values are kept as given and clamped at
+-/// each use (`renderer.Zoom.resolve`). This writes only the zoom: the
+-/// font size, the grid and the pty size do not change.
++/// A scale of 1 is no zoom. The values are kept as given and resolved at
++/// each use (`renderer.Zoom.view`). This writes only the zoom: the
++/// font size, the grid and the pty size do not change. The renderer
++/// draws the next frame with it.
+ pub fn setZoom(self: *Surface, request: rendererpkg.Zoom) void {
+-    self.renderer_state.mutex.lockUncancelable(global.io());
+-    defer self.renderer_state.mutex.unlock(global.io());
+-    self.renderer_state.zoom = request;
++    {
++        self.renderer_state.mutex.lockUncancelable(global.io());
++        defer self.renderer_state.mutex.unlock(global.io());
++        self.renderer_state.zoom = request;
++    }
++    self.queueRender() catch |err| {
++        log.warn("error queueing a render after a zoom err={}", .{err});
++    };
+ }
+ 
+ /// How far below its row-aligned position the renderer draws the
+diff --git a/src/font/Collection.zig b/src/font/Collection.zig
+index dec64f659..b0f608278 100644
+--- a/src/font/Collection.zig
++++ b/src/font/Collection.zig
+@@ -568,6 +568,126 @@ pub fn setSize(
+     try self.updateMetrics();
+ }
+ 
++/// True if this build can mirror a collection (`initMirror`). Only the
++/// CoreText faces can be copied at a new size.
++pub const mirror_supported = font.Discover == font.discovery.CoreText and
++    @hasDecl(Face, "initFontCopy");
++
++pub const MirrorError = Allocator.Error || error{
++    /// This build cannot copy faces (`mirror_supported`).
++    MirrorUnsupported,
++    /// `load_options` is null.
++    DeferredLoadingUnavailable,
++    /// An alias of the base points to an entry that is not in the base.
++    MirrorAliasNotFound,
++    /// A face could not be copied at the new size.
++    MirrorFaceFailed,
++};
++
++/// A collection with the faces of `base` in the same order, each at
++/// `size` (times its own scale factor, as in `setSize`), and no metric
++/// modifiers. A zoomed glyph grid draws with it: the base grid shapes
++/// the text, so a font index must name the same face in both. A grid of
++/// its own (`SharedGridSet.ref`) lists its faces in the order its own
++/// lookups found them, so its indices can name other faces.
++///
++/// `base` must not change while this runs: hold its grid's lock.
++pub fn initMirror(
++    alloc: Allocator,
++    base: *Collection,
++    size: DesiredSize,
++) MirrorError!Collection {
++    var opts = base.load_options orelse return error.DeferredLoadingUnavailable;
++    opts.size = size;
++
++    var result: Collection = .init();
++    result.load_options = opts;
++    errdefer result.deinit(alloc);
++    try result.mirror(alloc, base);
++    return result;
++}
++
++/// Add the entries of `base` that this mirror does not have yet, in the
++/// order of `base` (see `initMirror`). The base finds a new fallback face
++/// when its text first needs one, so a mirror calls this again when the
++/// base has an index that it does not have.
++///
++/// `base` must not change while this runs: hold its grid's lock.
++pub fn mirror(
++    self: *Collection,
++    alloc: Allocator,
++    base: *Collection,
++) MirrorError!void {
++    if (comptime !mirror_supported) return error.MirrorUnsupported;
++    const opts = self.load_options orelse return error.DeferredLoadingUnavailable;
++
++    // An alias points into an earlier style (bold italic to bold, the
++    // others to regular), so the styles are mirrored in order.
++    for (std.enums.values(Style)) |style| {
++        const src = base.faces.getPtr(style);
++        const dst = self.faces.getPtr(style);
++        while (dst.count() < src.count()) {
++            const item: EntryOrAlias = switch (src.at(dst.count()).*) {
++                .alias => |target| .{ .alias = try self.mirrorOf(base, target) },
++                .entry => |*entry| .{ .entry = try mirrorEntry(entry, opts) },
++            };
++            dst.append(alloc, item) catch |err| {
++                var it = item;
++                if (it == .entry) it.entry.deinit();
++                return err;
++            };
++        }
++    }
++}
++
++/// The entry of this mirror at the place that `target` has in `base`.
++fn mirrorOf(self: *Collection, base: *Collection, target: *Entry) MirrorError!*Entry {
++    for (std.enums.values(Style)) |style| {
++        const src = base.faces.getPtr(style);
++        const dst = self.faces.getPtr(style);
++        var i: usize = 0;
++        while (i < src.count()) : (i += 1) {
++            const item = src.at(i);
++            if (item.* != .entry or &item.entry != target) continue;
++            if (i >= dst.count()) return error.MirrorAliasNotFound;
++            return dst.at(i).getEntry();
++        }
++    }
++    return error.MirrorAliasNotFound;
++}
++
++/// A copy of `entry` at the size of `opts`. A deferred face stays
++/// deferred; a loaded face is copied at its own scale of that size.
++fn mirrorEntry(entry: *Entry, opts: LoadOptions) MirrorError!Entry {
++    const face: Entry.AnyFace = switch (entry.face) {
++        .deferred => |d| deferred: {
++            var copy = d;
++            copy.ct.?.font.retain();
++            break :deferred .{ .deferred = copy };
++        },
++        .loaded => |*f| loaded: {
++            var face_opts = opts;
++            face_opts.size.points *= @floatCast(switch (entry.scale_factor) {
++                .scale => |v| v,
++                .adjustment => 1.0,
++            });
++            var copy = Face.initFontCopy(f.font, face_opts.faceOptions()) catch
++                return error.MirrorFaceFailed;
++            // As `Face.syntheticBold` sets it for this size.
++            if (f.synthetic_bold != null) {
++                const points: f64 = @floatCast(face_opts.size.points);
++                copy.synthetic_bold = @max(points / 14.0, 1);
++            }
++            break :loaded .{ .loaded = copy };
++        },
++    };
++    return .{
++        .face = face,
++        .fallback = entry.fallback,
++        .scale_factor = entry.scale_factor,
++    };
++}
++
+ /// Options for adjusting the size of a face relative to the primary face.
+ pub const SizeAdjustment = enum {
+     /// Don't adjust the size for this face, use the original point size.
+@@ -1522,3 +1642,80 @@ test "face metrics" {
+         wideMetrics.icWidth(),
+     );
+ }
++
++test "pane zoom: a mirror has the base's faces in order, at its size" {
++    if (comptime !mirror_supported) return error.SkipZigTest;
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var lib = try Library.init(alloc);
++    defer lib.deinit();
++
++    var c = init();
++    defer c.deinit(alloc);
++    c.load_options = .{ .library = lib, .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } };
++    _ = try c.add(alloc, try .init(
++        lib,
++        font.embedded.regular,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    ), .{
++        .style = .regular,
++        .fallback = false,
++        .size_adjustment = .none,
++    });
++    _ = try c.add(alloc, try .init(
++        lib,
++        font.embedded.symbols_nerd_font,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    ), .{
++        .style = .regular,
++        .fallback = true,
++        .size_adjustment = .none,
++    });
++    // Synthetic and aliased styles.
++    try c.completeStyles(alloc, .{});
++
++    var m = try initMirror(alloc, &c, .{ .points = 24, .xdpi = 96, .ydpi = 96 });
++    defer m.deinit(alloc);
++
++    for (std.enums.values(Style)) |style| {
++        const src = c.faces.getPtr(style);
++        const dst = m.faces.getPtr(style);
++        try testing.expectEqual(src.count(), dst.count());
++        var i: usize = 0;
++        while (i < src.count()) : (i += 1) {
++            const a = src.at(i);
++            const b = dst.at(i);
++            try testing.expectEqual(std.meta.activeTag(a.*), std.meta.activeTag(b.*));
++            try testing.expectEqual(a.getEntry().fallback, b.getEntry().fallback);
++        }
++    }
++
++    // The same lookups give the same index.
++    for ([_]u32{ 'A', 0xF023 }) |cp| {
++        for (std.enums.values(Style)) |style| {
++            try testing.expectEqual(
++                c.getIndex(cp, style, .{ .any = {} }),
++                m.getIndex(cp, style, .{ .any = {} }),
++            );
++        }
++    }
++
++    // A face of the mirror is at twice the size.
++    const face = try m.getFace(.{ .idx = 0 });
++    try testing.expectEqual(@as(f32, 24), face.size.points);
++
++    // A face that the base adds later is mirrored on the next call.
++    _ = try c.add(alloc, try .init(
++        lib,
++        font.embedded.regular,
++        .{ .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } },
++    ), .{
++        .style = .regular,
++        .fallback = true,
++        .size_adjustment = .none,
++    });
++    try testing.expectError(error.IndexOutOfBounds, m.getEntry(.{ .idx = 2 }));
++    try m.mirror(alloc, &c);
++    _ = try m.getEntry(.{ .idx = 2 });
++}
+diff --git a/src/font/SharedGrid.zig b/src/font/SharedGrid.zig
+index 700a16fe7..3803feed0 100644
+--- a/src/font/SharedGrid.zig
++++ b/src/font/SharedGrid.zig
+@@ -275,19 +275,107 @@ pub fn renderCodepoint(
+     // text which is relatively rare and almost non-existent in multiple
+     // surfaces at the same time.
+ 
++    const g = try self.codepointGlyph(alloc, cp, style, p) orelse return null;
++    return try self.renderGlyph(alloc, g.index, g.glyph_index, opts);
++}
++
++pub const CodepointGlyph = struct {
++    index: Collection.Index,
++    glyph_index: u32,
++};
++
++/// The font index and glyph index that `renderCodepoint` renders for a
++/// codepoint, or null if no font has it. A zoomed glyph grid renders
++/// them with `renderGlyph` (see `initZoomed`).
++pub fn codepointGlyph(
++    self: *SharedGrid,
++    alloc: Allocator,
++    cp: u32,
++    style: Style,
++    p: ?Presentation,
++) !?CodepointGlyph {
+     // Get the font that has the codepoint
+     const index = try self.getIndex(alloc, cp, style, p) orelse return null;
+ 
+     // Get the glyph for the font
+-    const glyph_index = glyph_index: {
+-        self.lock.lockSharedUncancelable(global.io());
+-        defer self.lock.unlockShared(global.io());
+-        const face = try self.resolver.collection.getFace(index);
+-        break :glyph_index face.glyphIndex(cp) orelse return null;
++    self.lock.lockSharedUncancelable(global.io());
++    defer self.lock.unlockShared(global.io());
++    const face = try self.resolver.collection.getFace(index);
++    const glyph_index = face.glyphIndex(cp) orelse return null;
++    return .{ .index = index, .glyph_index = glyph_index };
++}
++
++/// A grid that draws the glyphs of `base` for a zoomed picture: its
++/// faces are those of `base` in the same order (`Collection.initMirror`)
++/// at the font size times `scale`, and its cells are `cell_width` x
++/// `cell_height` pixels. The base grid keeps the layout and the shaping;
++/// this grid only renders the glyphs that the base grid found, by font
++/// index and glyph index. It never finds a face itself: a codepoint goes
++/// through `base.codepointGlyph`, and an index that it does not have yet
++/// through `mirror`.
++///
++/// The base's metric modifiers apply too, with an absolute value times
++/// `scale`. The cell size replaces any cell modifier. `modifiers` holds
++/// them and must live as long as the grid. The caller owns both.
++pub fn initZoomed(
++    alloc: Allocator,
++    base: *SharedGrid,
++    scale: f64,
++    cell_width: u32,
++    cell_height: u32,
++    modifiers: *Metrics.ModifierSet,
++) !SharedGrid {
++    var resolver: CodepointResolver = resolver: {
++        base.lock.lockSharedUncancelable(global.io());
++        defer base.lock.unlockShared(global.io());
++
++        const base_collection = &base.resolver.collection;
++        var size = (base_collection.load_options orelse
++            return error.DeferredLoadingUnavailable).size;
++        size.points *= @floatCast(scale);
++
++        modifiers.clearRetainingCapacity();
++        var it = base_collection.metric_modifiers.iterator();
++        while (it.next()) |entry| switch (entry.key_ptr.*) {
++            .cell_width, .cell_height => {},
++            else => try modifiers.put(alloc, entry.key_ptr.*, switch (entry.value_ptr.*) {
++                .percent => entry.value_ptr.*,
++                .absolute => |v| .{ .absolute = @intFromFloat(
++                    @round(@as(f64, @floatFromInt(v)) * scale),
++                ) },
++            }),
++        };
++
++        break :resolver .{
++            .collection = try Collection.initMirror(alloc, base_collection, size),
++            .styles = base.resolver.styles,
++        };
+     };
++    errdefer resolver.deinit(alloc);
+ 
+-    // Render
+-    return try self.renderGlyph(alloc, index, glyph_index, opts);
++    // The cell the font gives at this size is not the base cell times the
++    // scale (2x of 16x34 can be 31x69), so set it with the modifiers.
++    const collection = &resolver.collection;
++    collection.metric_modifiers = modifiers.*;
++    try collection.updateMetrics();
++    const natural = collection.metrics.?;
++    try modifiers.put(alloc, .cell_width, .{ .absolute = @as(i32, @intCast(cell_width)) -
++        @as(i32, @intCast(natural.cell_width)) });
++    try modifiers.put(alloc, .cell_height, .{ .absolute = @as(i32, @intCast(cell_height)) -
++        @as(i32, @intCast(natural.cell_height)) });
++    collection.metric_modifiers = modifiers.*;
++
++    return try init(alloc, resolver);
++}
++
++/// Add the faces of `base` that this zoomed grid (`initZoomed`) does not
++/// have yet. Call it when a font index of the base is out of bounds here.
++pub fn mirror(self: *SharedGrid, alloc: Allocator, base: *SharedGrid) !void {
++    self.lock.lockUncancelable(global.io());
++    defer self.lock.unlock(global.io());
++    base.lock.lockSharedUncancelable(global.io());
++    defer base.lock.unlockShared(global.io());
++    try self.resolver.collection.mirror(alloc, &base.resolver.collection);
+ }
+ 
+ pub const renderGlyph_tw = tripwire.module(enum {
+diff --git a/src/font/SharedGridSet.zig b/src/font/SharedGridSet.zig
+index 93451a01e..d1a93711f 100644
+--- a/src/font/SharedGridSet.zig
++++ b/src/font/SharedGridSet.zig
+@@ -851,3 +851,88 @@ test SharedGridSet {
+     set.deref(key1);
+     try testing.expectEqual(@as(usize, 0), set.count());
+ }
++
++test "pane zoom: a zoomed grid renders the base's glyphs by index" {
++    if (comptime !Collection.mirror_supported) return error.SkipZigTest;
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var set = try SharedGridSet.init(alloc);
++    defer set.deinit();
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    var keycfg = try DerivedConfig.init(alloc, &cfg);
++    defer keycfg.deinit();
++
++    const size: DesiredSize = .{ .points = 13, .xdpi = 144, .ydpi = 144 };
++    const key, const base = try set.ref(&keycfg, size);
++    defer set.deref(key);
++
++    // The base finds its faces: the primary in four styles, then a
++    // fallback face for an ideograph and for an emoji.
++    const Lookup = struct { cp: u32, style: Style, p: ?font.Presentation };
++    const before = [_]Lookup{
++        .{ .cp = 'M', .style = .regular, .p = null },
++        .{ .cp = 'M', .style = .bold, .p = null },
++        .{ .cp = 'M', .style = .italic, .p = null },
++        .{ .cp = 'M', .style = .bold_italic, .p = null },
++        .{ .cp = 0x4E2D, .style = .regular, .p = null },
++        .{ .cp = 0x1F600, .style = .regular, .p = .emoji },
++    };
++    for (before) |l| _ = try base.codepointGlyph(alloc, l.cp, l.style, l.p);
++
++    const scale: f64 = 2;
++    const cell_w = base.metrics.cell_width * 2;
++    const cell_h = base.metrics.cell_height * 2;
++    var modifiers: Metrics.ModifierSet = .{};
++    defer modifiers.deinit(alloc);
++    var zoomed = try SharedGrid.initZoomed(alloc, base, scale, cell_w, cell_h, &modifiers);
++    defer zoomed.deinit(alloc);
++
++    // Its cells are the whole-pixel size it was given.
++    try testing.expectEqual(cell_w, zoomed.metrics.cell_width);
++    try testing.expectEqual(cell_h, zoomed.metrics.cell_height);
++
++    // A fallback face that the base finds after the zoomed grid was made.
++    const after = [_]Lookup{.{ .cp = 0x0E01, .style = .regular, .p = null }};
++
++    for (before ++ after) |l| {
++        const g = (try base.codepointGlyph(alloc, l.cp, l.style, l.p)).?;
++        const b = try base.renderGlyph(alloc, g.index, g.glyph_index, .{
++            .grid_metrics = base.metrics,
++        });
++        const z = zoomed.renderGlyph(alloc, g.index, g.glyph_index, .{
++            .grid_metrics = zoomed.metrics,
++        }) catch |err| switch (err) {
++            error.IndexOutOfBounds => z: {
++                try zoomed.mirror(alloc, base);
++                break :z try zoomed.renderGlyph(alloc, g.index, g.glyph_index, .{
++                    .grid_metrics = zoomed.metrics,
++                });
++            },
++            else => return err,
++        };
++
++        // The same face, at twice the size.
++        try testing.expectEqual(b.presentation, z.presentation);
++        const bf = try base.resolver.collection.getFace(g.index);
++        const zf = try zoomed.resolver.collection.getFace(g.index);
++        var bbuf: [256]u8 = undefined;
++        var zbuf: [256]u8 = undefined;
++        try testing.expectEqualStrings(try bf.name(&bbuf), try zf.name(&zbuf));
++        try testing.expectApproxEqAbs(bf.size.points * 2, zf.size.points, 0.01);
++
++        // The glyph is twice as large, give or take the rounding.
++        const bw: i64 = b.glyph.width;
++        const zw: i64 = z.glyph.width;
++        try testing.expect(@abs(zw - 2 * bw) <= 3);
++    }
++
++    // The zoomed grid found no face itself: it has exactly the base's.
++    for (std.enums.values(Style)) |style| {
++        try testing.expectEqual(
++            base.resolver.collection.faces.getPtr(style).count(),
++            zoomed.resolver.collection.faces.getPtr(style).count(),
++        );
++    }
++}
+diff --git a/src/renderer/State.zig b/src/renderer/State.zig
+index 9913cf2a4..534fcb593 100644
+--- a/src/renderer/State.zig
++++ b/src/renderer/State.zig
+@@ -35,7 +35,8 @@ mouse: Mouse = .{},
+ 
+ /// The zoom of the picture as the host asked for it, in surface pixels
+ /// (`Surface.setZoom`). Resolve it against the surface size before use
+-/// (`renderer.Zoom.resolve`): a resize can make the pan too large.
++/// (`renderer.Zoom.view`, which the renderer draws with): a resize can
++/// make the pan too large.
+ zoom: renderer.Zoom = .identity,
+ 
+ /// Set by the surface as the first step of its teardown, before it joins
+diff --git a/src/renderer/Zoom.zig b/src/renderer/Zoom.zig
+index c8f77d00e..6cc93c277 100644
+--- a/src/renderer/Zoom.zig
++++ b/src/renderer/Zoom.zig
+@@ -98,6 +98,96 @@ pub fn inverse(self: Zoom, x: f64, y: f64) size.Coordinate.Surface {
+     };
+ }
+ 
++/// The zoom as the picture draws it on a surface of size `s`. The
++/// renderer draws with it, and the surface hit tests with it, so the two
++/// always agree.
++///
++/// A zoomed cell is a whole number of pixels, `round(scale x cell)` on
++/// each axis, so that box drawing and block glyphs tile with no gap. The
++/// scale on each axis is that cell over the base cell, so it can be a
++/// little different from the request (under 2% from 2x). The grid's
++/// top-left corner draws on a whole pixel, so a glyph from the zoomed
++/// glyph atlas lands on whole pixels too.
++pub fn view(request: Zoom, s: size.Size) View {
++    const width: f64 = @floatFromInt(s.screen.width);
++    const height: f64 = @floatFromInt(s.screen.height);
++    const z = request.resolve(width, height);
++    if (z.scale == 1 or s.cell.width == 0 or s.cell.height == 0) {
++        return .identity;
++    }
++
++    const cell = zoomedCell(z.scale, s.cell);
++    const sx = @as(f64, @floatFromInt(cell.width)) / @as(f64, @floatFromInt(s.cell.width));
++    const sy = @as(f64, @floatFromInt(cell.height)) / @as(f64, @floatFromInt(s.cell.height));
++    return .{
++        .scale = z.scale,
++        .scale_x = sx,
++        .scale_y = sy,
++        .offset_x = viewOffset(z.anchor_x, z.pan_x, sx, width, s.padding.left),
++        .offset_y = viewOffset(z.anchor_y, z.pan_y, sy, height, s.padding.top),
++    };
++}
++
++/// The whole-pixel size of a cell at `scale`.
++pub fn zoomedCell(scale: f64, cell: size.CellSize) size.CellSize {
++    return .{
++        .width = @intFromFloat(@round(scale * @as(f64, @floatFromInt(cell.width)))),
++        .height = @intFromFloat(@round(scale * @as(f64, @floatFromInt(cell.height)))),
++    };
++}
++
++/// The offset on one axis of `View`: the request's anchor and pan at the
++/// axis scale `s`, then moved by less than a pixel so that the grid's
++/// first cell (at `pad`) draws on a whole pixel. It stays in the range
++/// that keeps the surface covered: `offset <= 0` and
++/// `s * len + offset >= len`.
++fn viewOffset(anchor: f64, pan: f64, s: f64, len: f64, pad: u32) f64 {
++    const p: f64 = @floatFromInt(pad);
++    const lo = len * (1 - s);
++    const raw = std.math.clamp(anchor * (1 - s) + pan, lo, 0);
++    // Where the grid's first cell draws; a whole pixel if one is in range.
++    const first = s * p + raw;
++    const first_lo = @ceil(s * p + lo);
++    const first_hi = @floor(s * p);
++    if (first_lo > first_hi) return raw;
++    return std.math.clamp(@round(first), first_lo, first_hi) - s * p;
++}
++
++/// The zoom as drawn: a point `p` of the base surface draws at
++/// `scale_* * p + offset_*`. See `view`.
++pub const View = struct {
++    /// The scale of the request, after the clamp. The zoomed glyph atlas
++    /// is built at the font size times this.
++    scale: f64 = 1,
++    scale_x: f64 = 1,
++    scale_y: f64 = 1,
++    offset_x: f64 = 0,
++    offset_y: f64 = 0,
++
++    pub const identity: View = .{};
++
++    pub fn isIdentity(self: View) bool {
++        return self.scale_x == 1 and self.scale_y == 1 and
++            self.offset_x == 0 and self.offset_y == 0;
++    }
++
++    /// The point on screen where the picture draws the base point.
++    pub fn forward(self: View, x: f64, y: f64) size.Coordinate.Surface {
++        return .{
++            .x = self.scale_x * x + self.offset_x,
++            .y = self.scale_y * y + self.offset_y,
++        };
++    }
++
++    /// The base point that the picture draws at the screen point.
++    pub fn inverse(self: View, x: f64, y: f64) size.Coordinate.Surface {
++        return .{
++            .x = (x - self.offset_x) / self.scale_x,
++            .y = (y - self.offset_y) / self.scale_y,
++        };
++    }
++};
++
+ test "pane zoom: identity changes no point" {
+     const z = resolve(.{}, 800, 600);
+     try testing.expect(z.isIdentity());
+@@ -227,3 +317,103 @@ test "pane zoom: each cell drawn zoomed hit tests to that cell" {
+         }
+     }
+ }
++
++const test_size: size.Size = .{
++    .screen = .{ .width = 1610, .height = 1034 },
++    .cell = .{ .width = 16, .height = 34 },
++    .padding = .{ .top = 8, .bottom = 8, .left = 5, .right = 5 },
++};
++
++test "pane zoom: view of no zoom is the identity" {
++    try testing.expect(view(.{}, test_size).isIdentity());
++    try testing.expect(view(.{ .scale = 0.5 }, test_size).isIdentity());
++    var no_cell = test_size;
++    no_cell.cell = .{ .width = 0, .height = 0 };
++    try testing.expect(view(.{ .scale = 2 }, no_cell).isIdentity());
++}
++
++test "pane zoom: view cells are whole pixels" {
++    for ([_]f64{ 1.05, 1.1, 1.25, 1.5, 2, 2.37, 3 }) |sc| {
++        const v = view(.{ .scale = sc, .anchor_x = 300, .anchor_y = 200 }, test_size);
++        const cell = zoomedCell(sc, test_size.cell);
++        try testing.expectEqual(@as(f64, @floatFromInt(cell.width)), v.scale_x * 16);
++        try testing.expectEqual(@as(f64, @floatFromInt(cell.height)), v.scale_y * 34);
++        try testing.expectEqual(sc, v.scale);
++    }
++    // 1.1x of 16x34 is 17.6x37.4: drawn as 18x37.
++    const c = zoomedCell(1.1, test_size.cell);
++    try testing.expectEqual(@as(u32, 18), c.width);
++    try testing.expectEqual(@as(u32, 37), c.height);
++}
++
++test "pane zoom: view keeps the surface covered and the grid on whole pixels" {
++    const w: f64 = @floatFromInt(test_size.screen.width);
++    const h: f64 = @floatFromInt(test_size.screen.height);
++    const pans = [_]f64{ -10_000, -333.3, -1, 0, 0.4, 1, 271.7, 10_000 };
++    const anchors = [_]f64{ -50, 0, 123.4, 805, 1610, 2000 };
++    for ([_]f64{ 1.05, 1.1, 1.5, 2, 2.37, 3 }) |sc| {
++        for (anchors) |a| {
++            for (pans) |p| {
++                const v = view(.{
++                    .scale = sc,
++                    .anchor_x = a,
++                    .anchor_y = a / 2,
++                    .pan_x = p,
++                    .pan_y = -p,
++                }, test_size);
++                const tl = v.forward(0, 0);
++                const br = v.forward(w, h);
++                try testing.expect(tl.x <= 1e-9 and tl.y <= 1e-9);
++                try testing.expect(br.x >= w - 1e-9 and br.y >= h - 1e-9);
++                const first = v.forward(5, 8);
++                try testing.expectApproxEqAbs(@round(first.x), first.x, 1e-9);
++                try testing.expectApproxEqAbs(@round(first.y), first.y, 1e-9);
++            }
++        }
++    }
++}
++
++test "pane zoom: at a whole-pixel scale the view moves the request by less than a pixel" {
++    const req: Zoom = .{ .scale = 2, .anchor_x = 400.3, .anchor_y = 300.6, .pan_x = 10.2 };
++    const z = req.resolve(1610, 1034);
++    const v = view(req, test_size);
++    // At 2x the cell is exactly 32x68, so only the rounding moves it.
++    try testing.expectEqual(@as(f64, 2), v.scale_x);
++    try testing.expectEqual(@as(f64, 2), v.scale_y);
++    for ([_][2]f64{ .{ 0, 0 }, .{ 777, 555 } }) |pt| {
++        const a = z.forward(pt[0], pt[1]);
++        const b = v.forward(pt[0], pt[1]);
++        try testing.expect(@abs(a.x - b.x) <= 0.5 + 1e-9);
++        try testing.expect(@abs(a.y - b.y) <= 0.5 + 1e-9);
++    }
++}
++
++test "pane zoom: each cell the view draws hit tests to that cell" {
++    const grid = test_size.grid();
++    for ([_]f64{ 1.1, 2.37, 3 }) |sc| {
++        const v = view(.{
++            .scale = sc,
++            .anchor_x = 700,
++            .anchor_y = 300,
++            .pan_x = 90,
++            .pan_y = -40,
++        }, test_size);
++        var row: u32 = 0;
++        while (row < grid.rows) : (row += 1) {
++            var col: u32 = 0;
++            while (col < grid.columns) : (col += 1) {
++                // The center of the cell as drawn, from the zoomed cell size.
++                const cell = zoomedCell(sc, test_size.cell);
++                const origin = v.forward(5, 8);
++                const drawn_x = origin.x + @as(f64, @floatFromInt(col * cell.width)) +
++                    @as(f64, @floatFromInt(cell.width)) / 2;
++                const drawn_y = origin.y + @as(f64, @floatFromInt(row * cell.height)) +
++                    @as(f64, @floatFromInt(cell.height)) / 2;
++                const coord: size.Coordinate = .{ .surface = v.inverse(drawn_x, drawn_y) };
++                const hit = coord.convert(.grid, test_size).grid;
++                try testing.expectEqual(col, hit.x);
++                try testing.expectEqual(row, hit.y);
++            }
++        }
++    }
++}
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index 6b9a8cac5..e00890dea 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -907,6 +907,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         font_shaper: font.Shaper,
+         font_shaper_cache: font.ShaperCache,
+ 
++        /// The zoom of the picture as drawn (`renderer.Zoom.view`), from
++        /// the request in the render state at each frame. Layout, shaping
++        /// and every position in the cells stay on `font_grid`; the
++        /// shaders apply the zoom last.
++        zoom_view: renderer.Zoom.View = .identity,
++
++        /// The glyphs of a zoomed picture: a grid at the font size times
++        /// the zoom, with whole-pixel cells, that renders the glyphs that
++        /// `font_grid` shaped. Null at 1x. Null while zoomed too, if it
++        /// could not be built: the base glyphs are then drawn scaled and
++        /// soft.
++        zoom_glyphs: ?*ZoomGlyphs = null,
++
++        /// The scale at which `zoom_glyphs` could not be built, so that it
++        /// is not tried again at each frame.
++        zoom_glyphs_failed: f64 = 1,
++
+         /// The images that we may render.
+         images: ImageState = .empty,
+ 
+@@ -1592,6 +1609,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+ 
+             self.font_shaper.deinit();
+             self.font_shaper_cache.deinit(self.alloc);
++            if (self.zoom_glyphs) |z| {
++                z.grid.deinit(self.alloc);
++                z.modifiers.deinit(self.alloc);
++                self.alloc.destroy(z);
++            }
+ 
+             self.config.deinit();
+             self.api.deinit();
+@@ -2553,6 +2575,185 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             display_link.setRunning(should_run);
+         }
+ 
++        /// The pane zoom needs the zoom uniforms in the shaders. The Metal
++        /// shaders have them; the OpenGL shaders are not changed, so an
++        /// OpenGL renderer always draws at 1x.
++        const zoom_supported = @hasField(shaderpkg.Uniforms, "zoom");
++
++        /// See `zoom_glyphs`.
++        const ZoomGlyphs = struct {
++            grid: font.SharedGrid,
++            /// The metric modifiers of `grid` (`SharedGrid.initZoomed`).
++            modifiers: font.Metrics.ModifierSet = .{},
++            /// The zoom scale `grid` was built for.
++            scale: f64,
++        };
++
++        /// The grid that renders glyphs: the zoomed glyph grid while there
++        /// is one, else `font_grid`.
++        fn glyphGrid(self: *const Self) *font.SharedGrid {
++            return if (self.zoom_glyphs) |z| &z.grid else self.font_grid;
++        }
++
++        /// Render a glyph that `font_grid` shaped, from `glyphGrid`, with
++        /// the metrics of that grid. A font index that the zoomed glyph
++        /// grid does not have yet (the base found a new fallback face)
++        /// gets its face first.
++        fn renderGlyph(
++            self: *Self,
++            index: font.Collection.Index,
++            glyph_index: u32,
++            opts: font.Glyph.RenderOptions,
++        ) font.SharedGrid.RenderGlyphError!font.SharedGrid.Render {
++            const z = self.zoom_glyphs orelse {
++                var o = opts;
++                o.grid_metrics = self.grid_metrics;
++                return self.font_grid.renderGlyph(self.alloc, index, glyph_index, o);
++            };
++            var o = opts;
++            o.grid_metrics = z.grid.metrics;
++            return z.grid.renderGlyph(self.alloc, index, glyph_index, o) catch |err| switch (err) {
++                error.IndexOutOfBounds => {
++                    z.grid.mirror(self.alloc, self.font_grid) catch |mirror_err| {
++                        log.warn("error adding a face to the zoomed glyphs err={}", .{mirror_err});
++                        return err;
++                    };
++                    return z.grid.renderGlyph(self.alloc, index, glyph_index, o);
++                },
++                else => err,
++            };
++        }
++
++        /// `SharedGrid.renderCodepoint` through `renderGlyph`: `font_grid`
++        /// finds the face and the glyph, so that the zoomed glyph grid
++        /// never finds a face of its own.
++        fn renderCodepoint(
++            self: *Self,
++            cp: u32,
++            style: font.Style,
++            p: ?font.Presentation,
++            opts: font.Glyph.RenderOptions,
++        ) !?font.SharedGrid.Render {
++            const g = try self.font_grid.codepointGlyph(self.alloc, cp, style, p) orelse
++                return null;
++            return try self.renderGlyph(g.index, g.glyph_index, opts);
++        }
++
++        /// A distance in base pixels (a shaper offset) in the pixels of
++        /// the grid that renders glyphs: times the zoomed cell over the
++        /// base cell on each axis.
++        fn glyphPixels(self: *const Self, x: i32, y: i32) [2]i32 {
++            const z = self.zoom_glyphs orelse return .{ x, y };
++            const sx = @as(f64, @floatFromInt(z.grid.metrics.cell_width)) /
++                @as(f64, @floatFromInt(self.grid_metrics.cell_width));
++            const sy = @as(f64, @floatFromInt(z.grid.metrics.cell_height)) /
++                @as(f64, @floatFromInt(self.grid_metrics.cell_height));
++            return .{
++                @intFromFloat(@round(@as(f64, @floatFromInt(x)) * sx)),
++                @intFromFloat(@round(@as(f64, @floatFromInt(y)) * sy)),
++            };
++        }
++
++        /// Make each frame copy the atlas textures again at its next draw,
++        /// after the grid that renders glyphs changed.
++        fn resetAtlasStamps(self: *Self) void {
++            if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
++                frame.grayscale_modified = 0;
++                frame.color_modified = 0;
++            };
++        }
++
++        /// Free the zoomed glyph grid. Caller must hold the draw mutex.
++        fn dropZoomGlyphs(self: *Self) void {
++            const z = self.zoom_glyphs orelse return;
++            z.grid.deinit(self.alloc);
++            z.modifiers.deinit(self.alloc);
++            self.alloc.destroy(z);
++            self.zoom_glyphs = null;
++            self.resetAtlasStamps();
++            self.markDirty();
++        }
++
++        fn buildZoomGlyphs(self: *Self, scale: f64) !void {
++            const z = try self.alloc.create(ZoomGlyphs);
++            errdefer self.alloc.destroy(z);
++            z.* = .{ .grid = undefined, .scale = scale };
++            errdefer z.modifiers.deinit(self.alloc);
++            const cell = renderer.Zoom.zoomedCell(scale, self.size.cell);
++            z.grid = try font.SharedGrid.initZoomed(
++                self.alloc,
++                self.font_grid,
++                scale,
++                cell.width,
++                cell.height,
++                &z.modifiers,
++            );
++            self.zoom_glyphs = z;
++            self.resetAtlasStamps();
++            self.markDirty();
++        }
++
++        /// Take the zoom the host asked for (`Surface.setZoom`) for this
++        /// frame: the drawn transform, and the zoomed glyph grid for its
++        /// scale. A change of the pan only changes uniforms. A change of
++        /// the scale builds a new glyph grid and rebuilds every cell (the
++        /// atlas positions change); a zoom back to 1x frees the grid.
++        ///
++        /// Caller must hold the draw mutex.
++        fn applyZoom(self: *Self, request: renderer.Zoom) void {
++            const view: renderer.Zoom.View = if (comptime zoom_supported)
++                request.view(self.size)
++            else
++                .identity;
++
++            if (self.zoom_glyphs) |z| {
++                if (z.scale != view.scale) self.dropZoomGlyphs();
++            }
++            if (view.scale == 1) self.zoom_glyphs_failed = 1;
++            if (view.scale != 1 and self.zoom_glyphs == null and
++                self.zoom_glyphs_failed != view.scale)
++            {
++                self.buildZoomGlyphs(view.scale) catch |err| {
++                    log.warn("error building the zoomed glyphs scale={} err={}", .{ view.scale, err });
++                    self.zoom_glyphs_failed = view.scale;
++                    // The base glyphs draw scaled, from other atlas positions.
++                    self.markDirty();
++                };
++            }
++
++            self.zoom_view = view;
++            self.updateZoomUniforms();
++        }
++
++        /// Update the uniforms of the pane zoom from `zoom_view` and the
++        /// grid that renders glyphs. Caller must hold the draw mutex.
++        fn updateZoomUniforms(self: *Self) void {
++            if (comptime !zoom_supported) return;
++            const v = self.zoom_view;
++            const pad_x: f64 = @floatFromInt(self.size.padding.left);
++            const pad_y: f64 = @floatFromInt(self.size.padding.top);
++            // In grid pixels: a grid pixel p draws at scale * p + offset.
++            self.uniforms.zoom = .{
++                @floatCast(v.scale_x),
++                @floatCast(v.scale_y),
++                @floatCast(v.offset_x + (v.scale_x - 1) * pad_x),
++                @floatCast(v.offset_y + (v.scale_y - 1) * pad_y),
++            };
++            // A glyph is drawn at the zoom, from atlas pixels of the cell
++            // size of the grid that rendered it.
++            const grid = self.glyphGrid();
++            const base_w: f64 = @floatFromInt(self.grid_metrics.cell_width);
++            const base_h: f64 = @floatFromInt(self.grid_metrics.cell_height);
++            const glyph_w: f64 = @floatFromInt(grid.metrics.cell_width);
++            const glyph_h: f64 = @floatFromInt(grid.metrics.cell_height);
++            self.uniforms.glyph_cell = .{
++                @floatCast(v.scale_x * base_w / glyph_w),
++                @floatCast(v.scale_y * base_h / glyph_h),
++                @floatCast(glyph_w),
++                @floatCast(glyph_h),
++            };
++        }
++
+         /// Set the new font grid.
+         ///
+         /// Must be called on the render thread.
+@@ -2560,7 +2761,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             self.draw_mutex.lockUncancelable(global.io());
+             defer self.draw_mutex.unlock(global.io());
+ 
+-            // Update our grid
++            // Update our grid. The zoomed glyphs mirror the old grid; the
++            // next frame builds them again from this one.
++            self.dropZoomGlyphs();
++            self.zoom_glyphs_failed = 1;
+             self.font_grid = grid;
+ 
+             // Update all our textures so that they sync on the next frame.
+@@ -2611,6 +2815,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 @floatFromInt(self.grid_metrics.cell_width),
+                 @floatFromInt(self.grid_metrics.cell_height),
+             };
++            self.updateZoomUniforms();
+         }
+ 
+         /// Update the frame data.
+@@ -2649,6 +2854,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 preedit: ?renderer.State.Preedit,
+                 scrollbar: terminal.Scrollbar,
+                 overlay_features: []const Overlay.Feature,
++                zoom: renderer.Zoom,
+             };
+ 
+             // Update all our data as tightly as possible within the mutex.
+@@ -2839,6 +3045,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     .preedit = preedit,
+                     .scrollbar = scrollbar,
+                     .overlay_features = overlay_features,
++                    .zoom = state.zoom,
+                 };
+             };
+ 
+@@ -2928,6 +3135,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 self.draw_mutex.lockUncancelable(global.io());
+                 defer self.draw_mutex.unlock(global.io());
+ 
++                // The zoom first: a new zoomed glyph grid makes the cells
++                // below rebuild from it.
++                self.applyZoom(critical.zoom);
++
+                 // Build our GPU cells
+                 self.rebuildCells(
+                     critical.preedit,
+@@ -3209,22 +3420,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 frame.bg_image_buffer_modified = self.bg_image_buffer_modified;
+             }
+ 
+-            // If our font atlas changed, sync the texture data
++            // If our font atlas changed, sync the texture data. The atlas
++            // is the zoomed glyph grid's while the picture is zoomed.
++            const glyph_grid = self.glyphGrid();
+             texture: {
+-                const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
++                const modified = glyph_grid.atlas_grayscale.modified.load(.monotonic);
+                 if (modified <= frame.grayscale_modified) break :texture;
+-                self.font_grid.lock.lockSharedUncancelable(global.io());
+-                defer self.font_grid.lock.unlockShared(global.io());
+-                frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
+-                try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
++                glyph_grid.lock.lockSharedUncancelable(global.io());
++                defer glyph_grid.lock.unlockShared(global.io());
++                frame.grayscale_modified = glyph_grid.atlas_grayscale.modified.load(.monotonic);
++                try self.syncAtlasTexture(&glyph_grid.atlas_grayscale, &frame.grayscale);
+             }
+             texture: {
+-                const modified = self.font_grid.atlas_color.modified.load(.monotonic);
++                const modified = glyph_grid.atlas_color.modified.load(.monotonic);
+                 if (modified <= frame.color_modified) break :texture;
+-                self.font_grid.lock.lockSharedUncancelable(global.io());
+-                defer self.font_grid.lock.unlockShared(global.io());
+-                frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
+-                try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
++                glyph_grid.lock.lockSharedUncancelable(global.io());
++                defer glyph_grid.lock.unlockShared(global.io());
++                frame.color_modified = glyph_grid.atlas_color.modified.load(.monotonic);
++                try self.syncAtlasTexture(&glyph_grid.atlas_color, &frame.color);
+             }
+ 
+             // Get a frame context from the graphics API.
+@@ -4845,8 +5058,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 .curly => .underline_curly,
+             };
+ 
+-            const render = try self.font_grid.renderGlyph(
+-                self.alloc,
++            const render = try self.renderGlyph(
+                 font.sprite_index,
+                 @backingInt(sprite),
+                 .{
+@@ -4876,8 +5088,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             color: terminal.color.RGB,
+             alpha: u8,
+         ) !void {
+-            const render = try self.font_grid.renderGlyph(
+-                self.alloc,
++            const render = try self.renderGlyph(
+                 font.sprite_index,
+                 @backingInt(font.Sprite.overline),
+                 .{
+@@ -4907,8 +5118,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             color: terminal.color.RGB,
+             alpha: u8,
+         ) !void {
+-            const render = try self.font_grid.renderGlyph(
+-                self.alloc,
++            const render = try self.renderGlyph(
+                 font.sprite_index,
+                 @backingInt(font.Sprite.strikethrough),
+                 .{
+@@ -4946,8 +5156,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             const cp = cell.codepoint();
+ 
+             // Render
+-            const render = try self.font_grid.renderGlyph(
+-                self.alloc,
++            const render = try self.renderGlyph(
+                 shaper_run.font_index,
+                 shaper_cell.glyph_index,
+                 .{
+@@ -4976,6 +5185,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 return;
+             }
+ 
++            // The shaper's offsets are in base pixels; a zoomed glyph's
++            // bearings are in the pixels of the grid that rendered it.
++            const shaper_offset = self.glyphPixels(shaper_cell.x_offset, shaper_cell.y_offset);
++
+             try self.cells.add(self.alloc, .text, .{
+                 .atlas = switch (render.presentation) {
+                     .emoji => .color,
+@@ -4987,8 +5200,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                 .glyph_size = .{ render.glyph.width, render.glyph.height },
+                 .bearings = .{
+-                    @intCast(render.glyph.offset_x + shaper_cell.x_offset),
+-                    @intCast(render.glyph.offset_y + shaper_cell.y_offset),
++                    @intCast(render.glyph.offset_x + shaper_offset[0]),
++                    @intCast(render.glyph.offset_y + shaper_offset[1]),
+                 },
+             });
+         }
+@@ -5049,8 +5262,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                         .lock => unreachable,
+                     };
+ 
+-                    break :render self.font_grid.renderGlyph(
+-                        self.alloc,
++                    break :render self.renderGlyph(
+                         font.sprite_index,
+                         @backingInt(sprite),
+                         .{
+@@ -5063,8 +5275,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     };
+                 },
+ 
+-                .lock => self.font_grid.renderCodepoint(
+-                    self.alloc,
++                .lock => self.renderCodepoint(
+                     0xF023, // lock symbol
+                     .regular,
+                     .text,
+@@ -5086,16 +5297,40 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             if (tracked) {
+                 const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                 const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
++                // The rect is in base grid pixels, as the shaders take it,
++                // so while the glyphs are zoomed it comes from the base
++                // grid's sprite.
++                const glyph: font.Glyph = if (self.zoom_glyphs == null) render.glyph else base: {
++                    const sprite: font.Sprite = switch (cursor_style) {
++                        .block => .cursor_rect,
++                        .bar => .cursor_bar,
++                        .underline => .cursor_underline,
++                        .block_hollow, .lock => unreachable,
++                    };
++                    const base = self.font_grid.renderGlyph(
++                        self.alloc,
++                        font.sprite_index,
++                        @backingInt(sprite),
++                        .{
++                            .cell_width = if (wide) 2 else 1,
++                            .grid_metrics = self.grid_metrics,
++                        },
++                    ) catch |err| {
++                        log.warn("error rendering cursor glyph err={}", .{err});
++                        return;
++                    };
++                    break :base base.glyph;
++                };
+                 // The sprite's rect in grid pixels: the X bearing is the
+                 // distance from the cell's left edge, the Y bearing from
+                 // the cell's bottom edge to the sprite's top.
+                 const rect: [4]f32 = .{
+                     @as(f32, @floatFromInt(x)) * cell_w +
+-                        @as(f32, @floatFromInt(render.glyph.offset_x)),
++                        @as(f32, @floatFromInt(glyph.offset_x)),
+                     @as(f32, @floatFromInt(cursor_vp.y)) * cell_h + cell_h -
+-                        @as(f32, @floatFromInt(render.glyph.offset_y)),
+-                    @floatFromInt(render.glyph.width),
+-                    @floatFromInt(render.glyph.height),
++                        @as(f32, @floatFromInt(glyph.offset_y)),
++                    @floatFromInt(glyph.width),
++                    @floatFromInt(glyph.height),
+                 };
+                 const cell: [2]u16 = .{ @intCast(x), @intCast(cursor_vp.y) };
+                 if (self.cursor_glide) |*glide| {
+@@ -5134,8 +5369,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             screen_fg: terminal.color.RGB,
+         ) !void {
+             // Render the glyph for our preedit text
+-            const render_ = self.font_grid.renderCodepoint(
+-                self.alloc,
++            const render_ = self.renderCodepoint(
+                 @intCast(cp.codepoint),
+                 .regular,
+                 .text,
+diff --git a/src/renderer/metal/shaders.zig b/src/renderer/metal/shaders.zig
+index 2af7605dd..44ef96eb6 100644
+--- a/src/renderer/metal/shaders.zig
++++ b/src/renderer/metal/shaders.zig
+@@ -310,6 +310,18 @@ pub const Uniforms = extern struct {
+     cursor_trail: [4]f32 align(16) = @splat(0),
+     cursor_trail_size: [4]f32 align(16) = @splat(0),
+ 
++    /// Pane zoom (`renderer.Zoom.View`), in grid pixels: a grid pixel `p`
++    /// draws at `zoom.xy * p + zoom.zw`. Every other position stays in
++    /// base grid pixels; the shaders apply this last, and its inverse
++    /// where they read a fragment's position. (1, 1, 0, 0) is no zoom.
++    zoom: [4]f32 align(16) = .{ 1, 1, 0, 0 },
++
++    /// The cell of the grid that rendered the glyphs: `.xy` is the scale
++    /// from its atlas pixels to screen pixels (1 for the zoomed glyph
++    /// grid, the zoom for base glyphs drawn zoomed, which are then
++    /// sampled linearly), `.zw` its cell size in atlas pixels.
++    glyph_cell: [4]f32 align(16) = .{ 1, 1, 0, 0 },
++
+     pub const max_region_anims = 4;
+     pub const max_ghost_rows = 64;
+ 
+diff --git a/src/renderer/shaders/shaders.metal b/src/renderer/shaders/shaders.metal
+index e443de763..212bf749c 100644
+--- a/src/renderer/shaders/shaders.metal
++++ b/src/renderer/shaders/shaders.metal
+@@ -60,12 +60,44 @@ struct Uniforms {
+   // (.z); opacity 0 while there is none. Drawn in cursor_fill's color.
+   float4 cursor_trail;
+   float4 cursor_trail_size;
++  // Pane zoom, in grid pixels: grid pixel p draws at zoom.xy * p +
++  // zoom.zw. Every other position here is in base grid pixels; the zoom
++  // applies last (zoom_grid), and its inverse where a fragment's position
++  // is read (screen_grid). (1, 1, 0, 0) is no zoom. The GLSL shaders do
++  // not have it: Macterm draws with Metal only.
++  float4 zoom;
++  // The cell of the grid that rendered the glyphs: .xy is the scale from
++  // its atlas pixels to screen pixels (1 for the zoomed glyph grid; the
++  // zoom for base glyphs drawn zoomed, which are sampled linearly), .zw
++  // its cell size in atlas pixels.
++  float4 glyph_cell;
+ };
+ 
++// Pane zoom: where grid pixel p draws, in grid pixels of the screen.
++float2 zoom_grid(constant Uniforms& uniforms, float2 p) {
++  return p * uniforms.zoom.xy + uniforms.zoom.zw;
++}
++
++// Pane zoom: the grid pixel that a drawn position ([[position]], in
++// screen pixels) shows. The inverse of zoom_grid, without the padding.
++// Every fragment that compares its position with the grid goes through
++// this.
++float2 screen_grid(constant Uniforms& uniforms, float2 position) {
++  return (position - uniforms.grid_padding.wx - uniforms.zoom.zw) /
++      uniforms.zoom.xy;
++}
++
++// Pane zoom: how many screen pixels one grid pixel is, for the width of
++// an antialiased edge, which is one screen pixel.
++float zoom_px(constant Uniforms& uniforms) {
++  return 0.5 * (uniforms.zoom.x + uniforms.zoom.y);
++}
++
+ // Cursor trail: the streak's opacity at grid pixel p. An axis-aligned box
+ // of the trail's half size swept along its segment (it slides rather than
+ // rotates, so a diagonal move leaves a slanted streak with square ends),
+-// with a one-pixel antialiased edge, times the streak's opacity.
++// with a one-pixel antialiased edge (a screen pixel, so zoom_px grid
++// pixels wide in a zoomed picture), times the streak's opacity.
+ float trail_coverage(constant Uniforms& uniforms, float2 p) {
+   float4 s = uniforms.cursor_trail_size;
+   if (s.z <= 0.0) return 0.0;
+@@ -75,7 +107,7 @@ float trail_coverage(constant Uniforms& uniforms, float2 p) {
+   float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+   float2 d = abs(p - (a + ab * h)) - s.xy;
+   float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+-  return (1.0 - smoothstep(0.0, 1.0, dist)) * s.z;
++  return (1.0 - smoothstep(0.0, 1.0, dist * zoom_px(uniforms))) * s.z;
+ }
+ 
+ // Cursor morph: the signed distance from p to the comet, a disc of
+@@ -100,11 +132,12 @@ float rect_distance(float2 p, float4 r) {
+   return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+ }
+ 
+-// Smooth cursor: how much of the 1x1 pixel centered on grid pixel p lies
+-// inside cursor_rect. Exact box coverage, so a resting cursor on whole
+-// pixels is as hard-edged as the sprite it replaces and only an edge in
+-// motion blends. Under cursor morph, the rect mixed with the comet by
+-// their distances, with a one-pixel antialiased edge.
++// Smooth cursor: how much of the screen pixel centered on grid pixel p
++// lies inside cursor_rect. A screen pixel is 1x1 grid pixels, or 1/zoom
++// of that in a zoomed picture. Exact box coverage, so a resting cursor on
++// whole pixels is as hard-edged as the sprite it replaces and only an
++// edge in motion blends. Under cursor morph, the rect mixed with the
++// comet by their distances, with a one-pixel antialiased edge.
+ float cursor_coverage(constant Uniforms& uniforms, float2 p) {
+   float4 r = uniforms.cursor_rect;
+   if (r.z <= 0.0 || r.w <= 0.0) return 0.0;
+@@ -112,21 +145,22 @@ float cursor_coverage(constant Uniforms& uniforms, float2 p) {
+   if (s.z > 0.0) {
+     float4 c = uniforms.cursor_comet;
+     float d = mix(rect_distance(p, r), comet_distance(p, c.xy, c.zw, s.x, s.y), s.z);
+-    return clamp(0.5 - d, 0.0, 1.0);
++    return clamp(0.5 - d * zoom_px(uniforms), 0.0, 1.0);
+   }
+   float2 lo = r.xy;
+   float2 hi = r.xy + r.zw;
+-  float2 c = clamp(min(hi, p + 0.5) - max(lo, p - 0.5), 0.0, 1.0);
++  float2 h = 0.5 / uniforms.zoom.xy;
++  float2 c = clamp(min(hi, p + h) - max(lo, p - h), 0.0, 2.0 * h) / (2.0 * h);
+   return c.x * c.y;
+ }
+ 
+-// A drawn position back on the grid's pixels: minus the padding and the
+-// smooth-scroll shift. A region scroll's shift stays in, as it is in
+-// cursor_rect.
++// A drawn position back on the grid's pixels: minus the padding, the
++// pane zoom and the smooth-scroll shift. A region scroll's shift stays
++// in, as it is in cursor_rect.
+ float2 grid_pixel(constant Uniforms& uniforms, float2 position) {
+   float shift_y = uniforms.scroll_offset.x -
+       uniforms.scroll_offset.y * uniforms.cell_size.y;
+-  return position - uniforms.grid_padding.wx - float2(0.0, shift_y);
++  return screen_grid(uniforms, position) - float2(0.0, shift_y);
+ }
+ 
+ // The region scroll animation a grid cell takes part in, or -1. `pos` is
+@@ -670,7 +704,7 @@ fragment float4 cell_bg_fragment(
+   constant Uniforms& uniforms [[buffer(1)]],
+   constant uchar4 *cells [[buffer(2)]]
+ ) {
+-  float2 rel = in.position.xy - uniforms.grid_padding.wx;
++  float2 rel = screen_grid(uniforms, in.position.xy);
+   float extra_rows = uniforms.scroll_offset.x != 0.0
+       ? max(uniforms.scroll_offset.y + uniforms.scroll_offset.w, 1.0)
+       : 0.0;
+@@ -842,14 +876,21 @@ vertex CellTextVertexOut cell_text_vertex(
+   // the y offset. The X bearing is the distance from the left of the cell
+   // to the left of the glyph, so it works as the x offset directly.
+ 
+-  float2 size = float2(in.glyph_size);
++  //
++  // Pane zoom: the cell's corner moves with the zoom (zoom_grid), and the
++  // glyph's size and bearings are in pixels of the cell it was rendered
++  // for (glyph_cell). The zoomed glyph grid renders them at the zoom, so
++  // they are screen pixels as they are (glyph_cell.xy is 1).
++
++  float2 size = float2(in.glyph_size) * uniforms.glyph_cell.xy;
+   float2 offset = float2(in.bearings);
+ 
+-  offset.y = uniforms.cell_size.y - offset.y;
++  offset.y = uniforms.glyph_cell.w - offset.y;
++  offset *= uniforms.glyph_cell.xy;
+ 
+   // Calculate the final position of the cell which uses our glyph size
+   // and glyph offset to create the correct bounding box for the glyph.
+-  cell_pos = cell_pos + size * corner + offset;
++  cell_pos = zoom_grid(uniforms, cell_pos) + size * corner + offset;
+   out.position =
+       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+ 
+@@ -914,16 +955,25 @@ fragment float4 cell_text_fragment(
+   texture2d<float> textureColor [[texture(1)]],
+   constant Uniforms& uniforms [[buffer(1)]]
+ ) {
+-  constexpr sampler textureSampler(
++  constexpr sampler nearestSampler(
+     coord::pixel,
+     address::clamp_to_edge,
+     filter::nearest
+   );
++  constexpr sampler linearSampler(
++    coord::pixel,
++    address::clamp_to_edge,
++    filter::linear
++  );
++  // Pane zoom: glyphs drawn at another size than their atlas pixels (the
++  // base glyphs, while there is no zoomed glyph grid) are sampled
++  // linearly, so they are soft, not blocky.
++  bool scaled = any(uniforms.glyph_cell.xy != float2(1.0));
+ 
+   // Region scroll animation: a glyph sliding in or out of its region
+   // stops at the region's edge.
+   {
+-    float2 rel = in.position.xy - uniforms.grid_padding.wx;
++    float2 rel = screen_grid(uniforms, in.position.xy);
+     if (rel.x < in.clip.x || rel.x >= in.clip.z ||
+         rel.y < in.clip.y || rel.y >= in.clip.w) {
+       discard_fragment();
+@@ -934,7 +984,7 @@ fragment float4 cell_text_fragment(
+   // clip it to the visible grid. Only while shifted, so glyphs that
+   // legitimately overhang a cell edge are untouched at rest.
+   if (uniforms.scroll_offset.x != 0.0) {
+-    float y = in.position.y - uniforms.grid_padding.x;
++    float y = screen_grid(uniforms, in.position.xy).y;
+     float extra_rows = max(uniforms.scroll_offset.y + uniforms.scroll_offset.w, 1.0);
+     float visible_h =
+         (float(uniforms.grid_size.y) - extra_rows) * uniforms.cell_size.y +
+@@ -975,7 +1025,9 @@ fragment float4 cell_text_fragment(
+       }
+ 
+       // Fetch our alpha mask for this pixel.
+-      float a = textureGrayscale.sample(textureSampler, in.tex_coord).r;
++      float a = scaled
++          ? textureGrayscale.sample(linearSampler, in.tex_coord).r
++          : textureGrayscale.sample(nearestSampler, in.tex_coord).r;
+ 
+       // Linear blending weight correction corrects the alpha value to
+       // produce blending results which match gamma-incorrect blending.
+@@ -1012,7 +1064,9 @@ fragment float4 cell_text_fragment(
+     case ATLAS_COLOR: {
+       // For now, we assume that color glyphs
+       // are already premultiplied linear colors.
+-      float4 color = textureColor.sample(textureSampler, in.tex_coord);
++      float4 color = scaled
++          ? textureColor.sample(linearSampler, in.tex_coord)
++          : textureColor.sample(nearestSampler, in.tex_coord);
+ 
+       // If we're doing linear blending, we can return this right away.
+       if (uniforms.use_linear_blending) {
+@@ -1097,6 +1151,9 @@ vertex ImageVertexOut image_vertex(
+   // so they move by the sub-row offset alone.
+   image_pos.y += uniforms.scroll_offset.x;
+ 
++  // Pane zoom: an image scales at its own resolution (linear sampling).
++  image_pos = zoom_grid(uniforms, image_pos);
++
+   out.position =
+       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);
+   out.tex_coord = tex_coord;
+-- 
+2.54.0 (Apple Git-157)
+
