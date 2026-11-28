@@ -851,3 +851,88 @@ test SharedGridSet {
     set.deref(key1);
     try testing.expectEqual(@as(usize, 0), set.count());
 }
+
+test "pane zoom: a zoomed grid renders the base's glyphs by index" {
+    if (comptime !Collection.mirror_supported) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var set = try SharedGridSet.init(alloc);
+    defer set.deinit();
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var keycfg = try DerivedConfig.init(alloc, &cfg);
+    defer keycfg.deinit();
+
+    const size: DesiredSize = .{ .points = 13, .xdpi = 144, .ydpi = 144 };
+    const key, const base = try set.ref(&keycfg, size);
+    defer set.deref(key);
+
+    // The base finds its faces: the primary in four styles, then a
+    // fallback face for an ideograph and for an emoji.
+    const Lookup = struct { cp: u32, style: Style, p: ?font.Presentation };
+    const before = [_]Lookup{
+        .{ .cp = 'M', .style = .regular, .p = null },
+        .{ .cp = 'M', .style = .bold, .p = null },
+        .{ .cp = 'M', .style = .italic, .p = null },
+        .{ .cp = 'M', .style = .bold_italic, .p = null },
+        .{ .cp = 0x4E2D, .style = .regular, .p = null },
+        .{ .cp = 0x1F600, .style = .regular, .p = .emoji },
+    };
+    for (before) |l| _ = try base.codepointGlyph(alloc, l.cp, l.style, l.p);
+
+    const scale: f64 = 2;
+    const cell_w = base.metrics.cell_width * 2;
+    const cell_h = base.metrics.cell_height * 2;
+    var modifiers: Metrics.ModifierSet = .{};
+    defer modifiers.deinit(alloc);
+    var zoomed = try SharedGrid.initZoomed(alloc, base, scale, cell_w, cell_h, &modifiers);
+    defer zoomed.deinit(alloc);
+
+    // Its cells are the whole-pixel size it was given.
+    try testing.expectEqual(cell_w, zoomed.metrics.cell_width);
+    try testing.expectEqual(cell_h, zoomed.metrics.cell_height);
+
+    // A fallback face that the base finds after the zoomed grid was made.
+    const after = [_]Lookup{.{ .cp = 0x0E01, .style = .regular, .p = null }};
+
+    for (before ++ after) |l| {
+        const g = (try base.codepointGlyph(alloc, l.cp, l.style, l.p)).?;
+        const b = try base.renderGlyph(alloc, g.index, g.glyph_index, .{
+            .grid_metrics = base.metrics,
+        });
+        const z = zoomed.renderGlyph(alloc, g.index, g.glyph_index, .{
+            .grid_metrics = zoomed.metrics,
+        }) catch |err| switch (err) {
+            error.IndexOutOfBounds => z: {
+                try zoomed.mirror(alloc, base);
+                break :z try zoomed.renderGlyph(alloc, g.index, g.glyph_index, .{
+                    .grid_metrics = zoomed.metrics,
+                });
+            },
+            else => return err,
+        };
+
+        // The same face, at twice the size.
+        try testing.expectEqual(b.presentation, z.presentation);
+        const bf = try base.resolver.collection.getFace(g.index);
+        const zf = try zoomed.resolver.collection.getFace(g.index);
+        var bbuf: [256]u8 = undefined;
+        var zbuf: [256]u8 = undefined;
+        try testing.expectEqualStrings(try bf.name(&bbuf), try zf.name(&zbuf));
+        try testing.expectApproxEqAbs(bf.size.points * 2, zf.size.points, 0.01);
+
+        // The glyph is twice as large, give or take the rounding.
+        const bw: i64 = b.glyph.width;
+        const zw: i64 = z.glyph.width;
+        try testing.expect(@abs(zw - 2 * bw) <= 3);
+    }
+
+    // The zoomed grid found no face itself: it has exactly the base's.
+    for (std.enums.values(Style)) |style| {
+        try testing.expectEqual(
+            base.resolver.collection.faces.getPtr(style).count(),
+            zoomed.resolver.collection.faces.getPtr(style).count(),
+        );
+    }
+}
